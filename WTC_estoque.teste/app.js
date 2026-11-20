@@ -4,6 +4,7 @@ const DATABASE_VERSION = 1;
 const ITEM_PAGE_SIZE = 100;
 const HISTORY_PAGE_SIZE = 100;
 const CODE_PAGE_SIZE = 200;
+const TRASH_RETENTION_DAYS = 30;
 
 const $ = (selector) => document.querySelector(selector);
 const esc = (value) => String(value).replace(/[&<>"']/g, (char) => ({
@@ -12,8 +13,37 @@ const esc = (value) => String(value).replace(/[&<>"']/g, (char) => ({
 const makeId = () => crypto.randomUUID ? crypto.randomUUID() : `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
 const formatNumber = (value) => new Intl.NumberFormat('pt-BR').format(value);
 
+function cleanFolderStatuses(statuses) {
+  const seen = new Set();
+  return (Array.isArray(statuses) ? statuses : []).map((status) => String(status || '').trim().slice(0, 50)).filter((status) => {
+    const key = status.toLocaleLowerCase('pt-BR');
+    if (!status || key === 'bom' || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function cleanTrash(entries) {
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  return (Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry?.folder && entry?.deletedAt && new Date(entry.deletedAt).getTime() > cutoff)
+    .map((entry) => {
+      const folder = { ...entry.folder, statuses: cleanFolderStatuses(entry.folder.statuses) };
+      const items = Array.isArray(entry.items) ? entry.items.map((item) => {
+        const conditions = item.conditions && typeof item.conditions === 'object' ? { ...item.conditions } : {};
+        if (item.unitStates && typeof item.unitStates === 'object') for (const [code, state] of Object.entries(item.unitStates)) conditions[code] ||= state;
+        return { ...item, codes: Array.isArray(item.codes) ? item.codes.map(String) : [], conditions };
+      }) : [];
+      for (const item of items) for (const state of Object.values(item.conditions)) {
+        const name = String(state || '').trim().slice(0, 50);
+        if (name && name.toLocaleLowerCase('pt-BR') !== 'bom' && !folder.statuses.some((status) => status.toLocaleLowerCase('pt-BR') === name.toLocaleLowerCase('pt-BR'))) folder.statuses.push(name);
+      }
+      return { ...entry, folder, items };
+    });
+}
+
 function freshDatabase() {
-  return { folders: [{ id: 'geral', name: 'Geral' }], items: [], history: [] };
+  return { folders: [{ id: 'geral', name: 'Geral', statuses: [] }], items: [], history: [], trash: [] };
 }
 
 function normalizeDatabase(raw) {
@@ -22,9 +52,9 @@ function normalizeDatabase(raw) {
   if (!Array.isArray(oldFolders) || !Array.isArray(oldItems)) throw new Error('Arquivo de estoque inválido.');
 
   const folders = oldFolders
-    .map((folder) => ({ id: String(folder.id || makeId()), name: String(folder.name || folder.nome || '').trim() }))
+    .map((folder) => ({ id: String(folder.id || makeId()), name: String(folder.name || folder.nome || '').trim(), statuses: cleanFolderStatuses(folder.statuses) }))
     .filter((folder) => folder.name);
-  if (!folders.length) folders.push({ id: 'geral', name: 'Geral' });
+  if (!folders.length) folders.push({ id: 'geral', name: 'Geral', statuses: [] });
   const folderIdsByName = new Map(folders.map((folder) => [folder.name.toLocaleLowerCase('pt-BR'), folder.id]));
 
   const items = oldItems.map((item) => {
@@ -34,13 +64,21 @@ function normalizeDatabase(raw) {
     const folderId = item.folderId || folderIdsByName.get(String(item.pasta || 'Geral').toLocaleLowerCase('pt-BR')) || folders[0].id;
     if (!name || !prefix) throw new Error('Há um item sem nome ou prefixo.');
     const conditions = item.conditions && typeof item.conditions === 'object' ? { ...item.conditions } : {};
+    if (item.unitStates && typeof item.unitStates === 'object') for (const [code, state] of Object.entries(item.unitStates)) conditions[code] ||= state;
     return { id: String(item.id || makeId()), name, prefix, folderId, codes, conditions };
   });
 
-  const history = Array.isArray(raw.history) ? raw.history : [];
-  return { folders, items, history };
-}
+  for (const item of items) {
+    const folder = folders.find((entry) => entry.id === item.folderId);
+    if (!folder) continue;
+    for (const status of Object.values(item.conditions)) {
+      const name = String(status || '').trim().slice(0, 50);
+      if (name && name.toLocaleLowerCase('pt-BR') !== 'bom' && !folder.statuses.some((entry) => entry.toLocaleLowerCase('pt-BR') === name.toLocaleLowerCase('pt-BR'))) folder.statuses.push(name);
+    }
+  }
 
+  return { folders, items, history: Array.isArray(raw.history) ? raw.history : [], trash: cleanTrash(raw.trash) };
+}
 let db = freshDatabase();
 let idb = null;
 let storageMode = 'indexeddb';
@@ -89,12 +127,13 @@ async function readAllFromIndexedDB() {
   const done = transactionResult(transaction);
   const metaStore = transaction.objectStore('meta');
   const foldersRequest = requestResult(metaStore.get('folders'));
+  const trashRequest = requestResult(metaStore.get('trash'));
   const readyRequest = requestResult(metaStore.get('ready'));
   const itemsRequest = requestResult(transaction.objectStore('items').getAll());
   const historyRequest = requestResult(transaction.objectStore('history').getAll());
-  const [foldersRecord, readyRecord, items, history] = await Promise.all([foldersRequest, readyRequest, itemsRequest, historyRequest]);
+  const [foldersRecord, trashRecord, readyRecord, items, history] = await Promise.all([foldersRequest, trashRequest, readyRequest, itemsRequest, historyRequest]);
   await done;
-  return { ready: readyRecord?.value === true, folders: foldersRecord?.value, items, history };
+  return { ready: readyRecord?.value === true, folders: foldersRecord?.value, trash: trashRecord?.value, items, history };
 }
 
 async function replaceAllInIndexedDB(data) {
@@ -107,6 +146,7 @@ async function replaceAllInIndexedDB(data) {
   items.clear();
   history.clear();
   meta.put({ key: 'folders', value: data.folders });
+  meta.put({ key: 'trash', value: data.trash || [] });
   meta.put({ key: 'ready', value: true });
   data.items.forEach((item) => items.put(item));
   data.history.forEach((event) => history.put(event));
@@ -135,7 +175,8 @@ async function initializeStorage() {
     storageMode = 'indexeddb';
     const saved = await readAllFromIndexedDB();
     if (saved.ready) {
-      db = { folders: saved.folders || [{ id: 'geral', name: 'Geral' }], items: saved.items, history: saved.history };
+      db = normalizeDatabase({ folders: saved.folders || [{ id: 'geral', name: 'Geral' }], items: saved.items, history: saved.history, trash: saved.trash });
+      await persistChanges({ folders: true, trash: true });
     } else {
       const legacy = readLegacyDatabase();
       db = legacy || freshDatabase();
@@ -162,11 +203,12 @@ async function persistChanges(changes = {}) {
     return;
   }
   const stores = [];
-  if (changes.folders || changes.items?.length || changes.deletedItems?.length) stores.push('meta', 'items');
+  if (changes.folders || changes.items?.length || changes.deletedItems?.length || changes.trash) stores.push('meta', 'items');
   if (changes.history?.length) stores.push('history');
   const transaction = idb.transaction([...new Set(stores)], 'readwrite');
   const done = transactionResult(transaction);
   if (changes.folders) transaction.objectStore('meta').put({ key: 'folders', value: db.folders });
+  if (changes.trash) transaction.objectStore('meta').put({ key: 'trash', value: db.trash });
   for (const item of changes.items || []) transaction.objectStore('items').put(item);
   for (const itemId of changes.deletedItems || []) transaction.objectStore('items').delete(itemId);
   for (const event of changes.history || []) transaction.objectStore('history').put(event);
@@ -179,12 +221,17 @@ async function replaceAll(data) {
 }
 
 async function saveChanges(changes, rollback) {
+  const oldTrash = db.trash;
+  const cleanedTrash = cleanTrash(db.trash);
+  const expiredTrash = JSON.stringify(cleanedTrash) !== JSON.stringify(db.trash);
+  if (expiredTrash) db.trash = cleanedTrash;
   try {
-    await persistChanges(changes);
+    await persistChanges(expiredTrash ? { ...changes, trash: true } : changes);
     render();
     void updateStorageInfo();
     return true;
   } catch (error) {
+    if (expiredTrash) db.trash = oldTrash;
     if (rollback) rollback();
     rebuildReservedCodes();
     render();
@@ -276,6 +323,33 @@ function nextCodes(prefix, quantity) {
   return codes;
 }
 
+function historyFolderId(event) {
+  if (event.folderId) return event.folderId;
+  const trashedItem = db.trash.find((entry) => entry.items.some((item) => item.id === event.itemId));
+  if (trashedItem) return trashedItem.folder.id;
+  return db.trash.find((entry) => entry.folder.name === event.folderName)?.folder.id
+    || db.folders.find((folder) => folder.name === event.folderName)?.id
+    || null;
+}
+
+function folderMovementTotals(folder) {
+  return db.history.reduce((totals, event) => {
+    if (historyFolderId(event) !== folder.id) return totals;
+    const quantity = Number(event.quantity) || 0;
+    if (event.type === 'entrada') totals.entries += quantity;
+    else if (event.type === 'saida') totals.exits += quantity;
+    return totals;
+  }, { entries: 0, exits: 0 });
+}
+
+function updateItemFolderSummary() {
+  const folder = db.folders.find((entry) => entry.id === $('#itemFolder').value);
+  if (!folder) { $('#itemFolderSummary').textContent = ''; return; }
+  const totals = folderMovementTotals(folder);
+  const units = db.items.filter((item) => item.folderId === folder.id).reduce((sum, item) => sum + item.codes.length, 0);
+  $('#itemFolderSummary').textContent = `Estoque: ${formatNumber(units)} un. · Entradas: ${formatNumber(totals.entries)} · Saídas: ${formatNumber(totals.exits)}`;
+}
+
 function render() {
   const previousFilter = $('#folderFilter').value || 'all';
   const folderCounts = new Map(db.folders.map((folder) => [folder.id, 0]));
@@ -285,7 +359,7 @@ function render() {
     totalUnits += item.codes.length;
   }
   $('#folderList').innerHTML = db.folders.map((folder) => {
-    return `<button class="folder-row ${activeFolder === folder.id ? 'active' : ''}" data-folder="${esc(folder.id)}"><i class="folder-dot"></i>${esc(folder.name)}<span class="count">${formatNumber(folderCounts.get(folder.id) || 0)}</span></button>`;
+    return `<div class="folder-entry"><button class="folder-row ${activeFolder === folder.id ? 'active' : ''}" data-folder="${esc(folder.id)}"><i class="folder-dot"></i>${esc(folder.name)}<span class="count">${formatNumber(folderCounts.get(folder.id) || 0)}</span></button>${folder.id === 'geral' ? '' : `<button class="icon-btn folder-delete" type="button" title="Mover pasta para a lixeira" aria-label="Excluir pasta ${esc(folder.name)}" data-delete-folder="${esc(folder.id)}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16M10 11v6m4-6v6M5 7l1 14h12l1-14M9 7V4h6v3"/></svg></button>`}</div>`;
   }).join('');
   $('#folderFilter').innerHTML = '<option value="all">Todas as pastas</option>' + db.folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)}</option>`).join('');
   $('#folderFilter').value = db.folders.some((folder) => folder.id === previousFilter) || previousFilter === 'all' ? previousFilter : 'all';
@@ -293,11 +367,23 @@ function render() {
   const oldFolder = folderSelect.value;
   folderSelect.innerHTML = db.folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)}</option>`).join('');
   if (db.folders.some((folder) => folder.id === oldFolder)) folderSelect.value = oldFolder;
+  updateItemFolderSummary();
 
   $('#navCount').textContent = formatNumber(db.items.length);
   $('#statTypes').textContent = formatNumber(db.items.length);
   $('#statFolders').textContent = formatNumber(db.folders.length);
   $('#statUnits').textContent = formatNumber(totalUnits);
+  $('#trashCount').textContent = formatNumber(db.trash.length);
+  const dashboardFolder = db.folders.find((entry) => entry.id === (activeFolder !== 'all' ? activeFolder : $('#folderFilter').value));
+  const folderInsights = $('#folderInsights');
+  folderInsights.hidden = !dashboardFolder;
+  if (dashboardFolder) {
+    const totals = folderMovementTotals(dashboardFolder);
+    const stock = db.items.filter((item) => item.folderId === dashboardFolder.id).reduce((sum, item) => sum + item.codes.length, 0);
+    $('#folderStockCount').textContent = formatNumber(stock);
+    $('#folderEntryCount').textContent = formatNumber(totals.entries);
+    $('#folderExitCount').textContent = formatNumber(totals.exits);
+  }
   const folder = db.folders.find((entry) => entry.id === activeFolder);
   const title = folder ? folder.name : 'Todos os itens';
   $('#pageTitle').textContent = title;
@@ -346,6 +432,7 @@ function openItem() {
   $('#itemQty').value = '1';
   $('#itemPrefix').value = '';
   if (activeFolder !== 'all' && db.folders.some((folder) => folder.id === activeFolder)) $('#itemFolder').value = activeFolder;
+  updateItemFolderSummary();
   $('#itemDialog').showModal();
   $('#itemName').focus();
 }
@@ -369,6 +456,76 @@ function printLabels(item) {
   window.print();
 }
 
+function renderTrash() {
+  $('#trashCount').textContent = formatNumber(db.trash.length);
+  $('#trashList').innerHTML = db.trash.length ? db.trash.map((entry) => {
+    const days = Math.max(1, Math.ceil((new Date(entry.deletedAt).getTime() + TRASH_RETENTION_DAYS * 86400000 - Date.now()) / 86400000));
+    const names = entry.items.length ? entry.items.map((item) => item.name).join(', ') : 'Nenhum item';
+    return `<div class="trash-entry"><div class="trash-entry-head"><div><div class="trash-entry-title">${esc(entry.folder.name)}</div><div class="trash-entry-info">Excluída em ${new Date(entry.deletedAt).toLocaleDateString('pt-BR')} · expira em ${days} dia(s) · ${formatNumber(entry.items.length)} ${entry.items.length === 1 ? 'item' : 'itens'}</div><div class="trash-entry-items">${esc(names)}</div></div><div class="trash-entry-actions"><button class="btn" type="button" data-restore-folder="${esc(entry.id)}">Restaurar</button><button class="btn btn-danger" type="button" data-purge-folder="${esc(entry.id)}">Apagar</button></div></div></div>`;
+  }).join('') : '<div class="empty">A lixeira está vazia.</div>';
+}
+
+async function openTrash() {
+  const previousLength = db.trash.length;
+  db.trash = cleanTrash(db.trash);
+  if (previousLength !== db.trash.length && !(await saveChanges({ trash: true }))) return;
+  renderTrash();
+  $('#trashDialog').showModal();
+}
+
+async function moveFolderToTrash(folderId) {
+  const index = db.folders.findIndex((folder) => folder.id === folderId);
+  if (index < 0) return;
+  const folder = db.folders[index];
+  if (folder.id === 'geral') return toast('A pasta Geral não pode ser excluída.');
+  const items = db.items.filter((item) => item.folderId === folderId);
+  if (!confirm(`Mover a pasta “${folder.name}” e ${items.length} ${items.length === 1 ? 'item' : 'itens'} para a lixeira?`)) return;
+  const oldItems = db.items;
+  const oldTrash = db.trash;
+  const oldActiveFolder = activeFolder;
+  db.folders.splice(index, 1);
+  db.items = db.items.filter((item) => item.folderId !== folderId);
+  db.trash = [{ id: makeId(), folder, items, deletedAt: new Date().toISOString() }, ...db.trash];
+  if (activeFolder === folderId) activeFolder = 'all';
+  if ($('#folderFilter').value === folderId) $('#folderFilter').value = 'all';
+  if (await saveChanges({ folders: true, deletedItems: items.map((item) => item.id), trash: true }, () => {
+    db.folders.splice(index, 0, folder);
+    db.items = oldItems;
+    db.trash = oldTrash;
+    activeFolder = oldActiveFolder;
+  })) {
+    items.forEach((item) => selectedItemIds.delete(item.id));
+    toast('Pasta movida para a lixeira por 30 dias.');
+  }
+}
+
+async function restoreFolderFromTrash(entryId) {
+  const entry = db.trash.find((row) => row.id === entryId);
+  if (!entry) return;
+  if (db.folders.some((folder) => folder.id === entry.folder.id || folder.name.toLocaleLowerCase('pt-BR') === entry.folder.name.toLocaleLowerCase('pt-BR'))) return toast('Já existe uma pasta com esse nome. Exclua a pasta atual antes de restaurar.');
+  const oldFolders = db.folders;
+  const oldItems = db.items;
+  const oldTrash = db.trash;
+  db.folders = [...db.folders, entry.folder];
+  db.items = [...db.items, ...entry.items];
+  db.trash = db.trash.filter((row) => row.id !== entryId);
+  if (await saveChanges({ folders: true, items: entry.items, trash: true }, () => { db.folders = oldFolders; db.items = oldItems; db.trash = oldTrash; })) {
+    renderTrash();
+    toast('Pasta e itens restaurados.');
+  }
+}
+
+async function purgeTrashEntry(entryId) {
+  const entry = db.trash.find((row) => row.id === entryId);
+  if (!entry || !confirm(`Apagar definitivamente a pasta “${entry.folder.name}” e seus itens?`)) return;
+  const oldTrash = db.trash;
+  db.trash = db.trash.filter((row) => row.id !== entryId);
+  if (await saveChanges({ trash: true }, () => { db.trash = oldTrash; })) {
+    renderTrash();
+    toast('Pasta apagada definitivamente.');
+  }
+}
+
 function renderHistory() {
   const pageCount = Math.max(1, Math.ceil(db.history.length / HISTORY_PAGE_SIZE));
   historyPage = Math.min(historyPage, pageCount - 1);
@@ -380,16 +537,65 @@ function renderHistory() {
   $('#historyNext').disabled = historyPage >= pageCount - 1;
 }
 
+function renderFolderStateControls(item) {
+  const folder = db.folders.find((entry) => entry.id === item.folderId);
+  if (!folder) return;
+  folder.statuses = cleanFolderStatuses(folder.statuses);
+  $('#folderStateTags').innerHTML = `<span class="folder-state-tag">Bom</span>` + folder.statuses.map((status) => `<span class="folder-state-tag">${esc(status)}<button class="folder-state-remove" type="button" title="Excluir estado ${esc(status)}" aria-label="Excluir estado ${esc(status)}" data-remove-folder-state="${esc(status)}">×</button></span>`).join('');
+}
+
 function renderCodePage() {
   const item = db.items.find((entry) => entry.id === $('#codesDialog').dataset.itemId);
   if (!item) return;
+  renderFolderStateControls(item);
+  const folder = db.folders.find((entry) => entry.id === item.folderId);
+  const statuses = ['Bom', ...(folder?.statuses || [])];
   const pageCount = Math.max(1, Math.ceil(item.codes.length / CODE_PAGE_SIZE));
   codePage = Math.min(codePage, pageCount - 1);
   const start = codePage * CODE_PAGE_SIZE;
-  $('#codeList').innerHTML = item.codes.slice(start, start + CODE_PAGE_SIZE).map((code) => `<div class="code-unit-row"><div class="code-chip">${esc(code)}</div><div><div class="condition-label">Estado da unidade</div><input class="condition-input" type="text" maxlength="50" list="conditionOptions" aria-label="Estado de ${esc(code)}" data-condition-item="${esc(item.id)}" data-condition-code="${esc(code)}" value="${esc(item.conditions?.[code] || 'Bom')}"></div></div>`).join('');
+  $('#codeList').innerHTML = item.codes.slice(start, start + CODE_PAGE_SIZE).map((code) => {
+    const state = item.conditions?.[code] || 'Bom';
+    return `<div class="code-unit-row"><div class="code-chip">${esc(code)}</div><div><div class="condition-label">Estado da unidade</div><select class="condition-input" aria-label="Estado de ${esc(code)}" data-condition-item="${esc(item.id)}" data-condition-code="${esc(code)}">${statuses.map((status) => `<option value="${esc(status)}" ${state === status ? 'selected' : ''}>${esc(status)}</option>`).join('')}</select></div></div>`;
+  }).join('');
   $('#codesPage').textContent = `Página ${codePage + 1} de ${pageCount}`;
   $('#codesPrev').disabled = codePage === 0;
   $('#codesNext').disabled = codePage >= pageCount - 1;
+}
+
+async function addFolderStatus() {
+  const item = db.items.find((entry) => entry.id === $('#codesDialog').dataset.itemId);
+  const folder = item && db.folders.find((entry) => entry.id === item.folderId);
+  const name = $('#newFolderState').value.trim().slice(0, 50);
+  if (!folder || !name) return;
+  const key = name.toLocaleLowerCase('pt-BR');
+  if (key === 'bom' || folder.statuses.some((status) => status.toLocaleLowerCase('pt-BR') === key)) return toast('Esse estado já existe ou é reservado pelo sistema.');
+  const oldStatuses = [...folder.statuses];
+  folder.statuses.push(name);
+  if (await saveChanges({ folders: true }, () => { folder.statuses = oldStatuses; })) {
+    $('#newFolderState').value = '';
+    renderCodePage();
+    toast('Estado adicionado a esta pasta.');
+  }
+}
+
+async function removeFolderStatus(status) {
+  const current = db.items.find((entry) => entry.id === $('#codesDialog').dataset.itemId);
+  const folder = current && db.folders.find((entry) => entry.id === current.folderId);
+  if (!folder) return;
+  const affected = db.items.filter((item) => item.folderId === folder.id && Object.values(item.conditions || {}).includes(status));
+  const count = affected.reduce((sum, item) => sum + Object.values(item.conditions || {}).filter((value) => value === status).length, 0);
+  if (!confirm(`Excluir o estado “${status}” desta pasta? ${count} unidade(s) voltarão para “Bom”.`)) return;
+  const oldStatuses = [...folder.statuses];
+  const oldConditions = affected.map((item) => [item, { ...(item.conditions || {}) }]);
+  folder.statuses = folder.statuses.filter((entry) => entry !== status);
+  for (const item of affected) {
+    for (const [code, value] of Object.entries(item.conditions || {})) if (value === status) delete item.conditions[code];
+  }
+  if (await saveChanges({ folders: true, items: affected }, () => {
+    folder.statuses = oldStatuses;
+    for (const [item, conditions] of oldConditions) item.conditions = conditions;
+  })) { renderCodePage(); toast('Estado excluído desta pasta.'); }
+  else renderCodePage();
 }
 
 function openBulkMove() {
@@ -415,7 +621,7 @@ $('#itemForm').addEventListener('submit', async (event) => {
   if (!prefix) return toast('Informe um prefixo para os códigos.');
   const item = { id: makeId(), name, prefix, folderId: $('#itemFolder').value, codes: nextCodes(prefix, quantity), conditions: {} };
   const folder = db.folders.find((entry) => entry.id === item.folderId);
-  const entry = { id: makeId(), type: 'entrada', itemId: item.id, itemName: item.name, prefix: item.prefix, folderName: folder?.name || 'Geral', quantity, codes: item.codes, notes: 'Cadastro inicial', createdAt: new Date().toISOString() };
+  const entry = { id: makeId(), type: 'entrada', itemId: item.id, folderId: item.folderId, itemName: item.name, prefix: item.prefix, folderName: folder?.name || 'Geral', quantity, codes: item.codes, notes: 'Cadastro inicial', createdAt: new Date().toISOString() };
   db.items.unshift(item);
   db.history.unshift(entry);
   rebuildReservedCodes();
@@ -432,7 +638,7 @@ $('#folderForm').addEventListener('submit', async (event) => {
   const name = $('#folderName').value.trim();
   if (!name) return;
   if (db.folders.some((folder) => folder.name.toLocaleLowerCase('pt-BR') === name.toLocaleLowerCase('pt-BR'))) return toast('Já existe uma pasta com esse nome.');
-  const folder = { id: makeId(), name };
+  const folder = { id: makeId(), name, statuses: [] };
   db.folders.push(folder);
   activeFolder = folder.id;
   $('#folderDialog').close();
@@ -444,8 +650,20 @@ $('#folderList').addEventListener('click', (event) => {
   const button = event.target.closest('[data-folder]');
   if (button) { activeFolder = button.dataset.folder; currentPage = 0; $('#folderFilter').value = 'all'; render(); }
 });
+$('#folderList').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-delete-folder]');
+  if (button) { event.preventDefault(); event.stopPropagation(); void moveFolderToTrash(button.dataset.deleteFolder); }
+});
+$('#trashList').addEventListener('click', (event) => {
+  const restore = event.target.closest('[data-restore-folder]');
+  if (restore) { void restoreFolderFromTrash(restore.dataset.restoreFolder); return; }
+  const purge = event.target.closest('[data-purge-folder]');
+  if (purge) void purgeTrashEntry(purge.dataset.purgeFolder);
+});
 document.querySelector('.sidebar-nav').addEventListener('click', () => { activeFolder = 'all'; currentPage = 0; $('#folderFilter').value = 'all'; render(); });
 $('#addFolderBtn').addEventListener('click', () => { $('#folderDialog').showModal(); $('#folderName').focus(); });
+$('#trashBtn').addEventListener('click', () => { void openTrash(); });
+$('#itemFolder').addEventListener('change', updateItemFolderSummary);
 $('#newItemBtn').addEventListener('click', openItem);
 $('#newItemTop').addEventListener('click', openItem);
 $('#searchInput').addEventListener('input', () => {
@@ -459,6 +677,12 @@ $('#historyPrev').addEventListener('click', () => { historyPage = Math.max(0, hi
 $('#historyNext').addEventListener('click', () => { historyPage += 1; renderHistory(); });
 $('#codesPrev').addEventListener('click', () => { codePage = Math.max(0, codePage - 1); renderCodePage(); });
 $('#codesNext').addEventListener('click', () => { codePage += 1; renderCodePage(); });
+$('#addFolderStateBtn').addEventListener('click', () => { void addFolderStatus(); });
+$('#newFolderState').addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); void addFolderStatus(); } });
+$('#folderStateTags').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-remove-folder-state]');
+  if (button) void removeFolderStatus(button.dataset.removeFolderState);
+});
 $('#itemsBody').addEventListener('change', (event) => {
   const checkbox = event.target.closest('[data-select-item]');
   if (!checkbox) return;
@@ -482,8 +706,18 @@ $('#bulkMoveForm').addEventListener('submit', async (event) => {
   const moving = selected.filter((item) => item.folderId !== destination);
   if (!moving.length) return toast('Os itens selecionados já estão nessa pasta.');
   const oldFolders = moving.map((item) => [item, item.folderId]);
-  for (const item of moving) item.folderId = destination;
-  if (await saveChanges({ items: moving }, () => { for (const [item, folderId] of oldFolders) item.folderId = folderId; })) {
+  const destinationFolder = db.folders.find((folder) => folder.id === destination);
+  const oldDestinationStatuses = [...(destinationFolder?.statuses || [])];
+  for (const item of moving) {
+    item.folderId = destination;
+    for (const status of Object.values(item.conditions || {})) {
+      if (status && status !== 'Bom' && destinationFolder && !destinationFolder.statuses.some((entry) => entry.toLocaleLowerCase('pt-BR') === status.toLocaleLowerCase('pt-BR'))) destinationFolder.statuses.push(status);
+    }
+  }
+  if (await saveChanges({ items: moving, folders: true }, () => {
+    for (const [item, folderId] of oldFolders) item.folderId = folderId;
+    if (destinationFolder) destinationFolder.statuses = oldDestinationStatuses;
+  })) {
     selectedItemIds.clear();
     $('#bulkMoveDialog').close();
     render();
@@ -586,7 +820,7 @@ $('#movementForm').addEventListener('submit', async (event) => {
     }
   }
   const folder = db.folders.find((entry) => entry.id === item.folderId);
-  const movement = { id: makeId(), type, itemId: item.id, itemName: item.name, prefix: item.prefix, folderName: folder?.name || 'Geral', quantity, codes, conditions, notes: $('#movementNote').value.trim(), createdAt: new Date().toISOString() };
+  const movement = { id: makeId(), type, itemId: item.id, folderId: item.folderId, itemName: item.name, prefix: item.prefix, folderName: folder?.name || 'Geral', quantity, codes, conditions, notes: $('#movementNote').value.trim(), createdAt: new Date().toISOString() };
   db.history.unshift(movement);
   $('#movementDialog').close();
   if (await saveChanges({ items: [item], history: [movement] }, () => {
