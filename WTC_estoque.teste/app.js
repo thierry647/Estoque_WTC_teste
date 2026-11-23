@@ -23,6 +23,10 @@ function cleanFolderStatuses(statuses) {
   });
 }
 
+function folderKey(name) {
+  return String(name || '').trim().replace(/\s+/g, ' ').normalize('NFKC').toLocaleLowerCase('pt-BR');
+}
+
 function cleanTrash(entries) {
   const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
   return (Array.isArray(entries) ? entries : [])
@@ -51,21 +55,63 @@ function normalizeDatabase(raw) {
   const oldItems = Array.isArray(raw?.items) ? raw.items : raw?.itens;
   if (!Array.isArray(oldFolders) || !Array.isArray(oldItems)) throw new Error('Arquivo de estoque inválido.');
 
-  const folders = oldFolders
-    .map((folder) => ({ id: String(folder.id || makeId()), name: String(folder.name || folder.nome || '').trim(), statuses: cleanFolderStatuses(folder.statuses) }))
-    .filter((folder) => folder.name);
-  if (!folders.length) folders.push({ id: 'geral', name: 'Geral', statuses: [] });
-  const folderIdsByName = new Map(folders.map((folder) => [folder.name.toLocaleLowerCase('pt-BR'), folder.id]));
+  const folders = [];
+  const folderIds = new Map();
+  const foldersByName = new Map();
+  const folderIdsUsed = new Set();
+  for (const source of oldFolders) {
+    const name = String(source?.name || source?.nome || '').trim();
+    if (!name) continue;
+    const key = folderKey(name);
+    let folder = foldersByName.get(key);
+    if (!folder) {
+      let id = String(source.id || makeId());
+      if (folderIdsUsed.has(id)) id = makeId();
+      folderIdsUsed.add(id);
+      folder = { id, name, statuses: [] };
+      folders.push(folder);
+      foldersByName.set(key, folder);
+    }
+    folder.statuses = cleanFolderStatuses([...folder.statuses, ...(Array.isArray(source.statuses) ? source.statuses : [])]);
+    if (source.id && !folderIds.has(String(source.id))) folderIds.set(String(source.id), folder.id);
+  }
+  let general = foldersByName.get(folderKey('Geral'));
+  if (!general) {
+    general = { id: folderIdsUsed.has('geral') ? makeId() : 'geral', name: 'Geral', statuses: [] };
+    folders.unshift(general);
+    foldersByName.set(folderKey('Geral'), general);
+    folderIdsUsed.add(general.id);
+  }
 
+  const usedCodes = new Set();
+  const usedItemIds = new Set();
   const items = oldItems.map((item) => {
     const name = String(item.name || item.nome || '').trim();
     const prefix = String(item.prefix || item.prefixo || '').trim();
-    const codes = Array.isArray(item.codes) ? item.codes.map(String) : Array.isArray(item.codigos) ? item.codigos.map(String) : [];
-    const folderId = item.folderId || folderIdsByName.get(String(item.pasta || 'Geral').toLocaleLowerCase('pt-BR')) || folders[0].id;
     if (!name || !prefix) throw new Error('Há um item sem nome ou prefixo.');
+    const requestedFolderId = folderIds.get(String(item.folderId || ''));
+    const folder = folders.find((entry) => entry.id === requestedFolderId)
+      || foldersByName.get(folderKey(item.pasta))
+      || general;
     const conditions = item.conditions && typeof item.conditions === 'object' ? { ...item.conditions } : {};
     if (item.unitStates && typeof item.unitStates === 'object') for (const [code, state] of Object.entries(item.unitStates)) conditions[code] ||= state;
-    return { id: String(item.id || makeId()), name, prefix, folderId, codes, conditions };
+    const sourceCodes = Array.isArray(item.codes) ? item.codes : Array.isArray(item.codigos) ? item.codigos : [];
+    const codes = [];
+    const normalizedConditions = {};
+    for (const sourceCode of sourceCodes) {
+      const originalCode = String(sourceCode).trim();
+      if (!originalCode) continue;
+      let code = originalCode;
+      let sequence = 1;
+      while (usedCodes.has(code.toLocaleLowerCase('pt-BR'))) code = prefix + String(sequence++).padStart(4, '0');
+      usedCodes.add(code.toLocaleLowerCase('pt-BR'));
+      codes.push(code);
+      if (conditions[originalCode]) normalizedConditions[code] = conditions[originalCode];
+    }
+    let id = String(item.id || makeId());
+    if (usedItemIds.has(id)) id = makeId();
+    usedItemIds.add(id);
+    return { id, name, prefix, folderId: folder.id, codes, conditions: normalizedConditions };
   });
 
   for (const item of items) {
@@ -76,8 +122,30 @@ function normalizeDatabase(raw) {
       if (name && name.toLocaleLowerCase('pt-BR') !== 'bom' && !folder.statuses.some((entry) => entry.toLocaleLowerCase('pt-BR') === name.toLocaleLowerCase('pt-BR'))) folder.statuses.push(name);
     }
   }
-
-  return { folders, items, history: Array.isArray(raw.history) ? raw.history : [], trash: cleanTrash(raw.trash) };
+  const history = (Array.isArray(raw.history) ? raw.history : []).map((event) => {
+    if (!event || typeof event !== 'object') return event;
+    const folderId = folderIds.get(String(event.folderId || '')) || foldersByName.get(folderKey(event.folderName))?.id;
+    const sourceFolderId = folderIds.get(String(event.sourceFolderId || '')) || foldersByName.get(folderKey(event.sourceFolderName))?.id;
+    const destinationFolderId = folderIds.get(String(event.destinationFolderId || '')) || foldersByName.get(folderKey(event.destinationFolderName))?.id;
+    return { ...event, ...(folderId ? { folderId } : {}), ...(sourceFolderId ? { sourceFolderId } : {}), ...(destinationFolderId ? { destinationFolderId } : {}) };
+  });
+  const trash = cleanTrash(raw.trash);
+  for (const entry of trash) for (const item of entry.items) {
+    const codes = [];
+    const conditions = {};
+    for (const originalCode of item.codes) {
+      const oldCode = String(originalCode).trim();
+      let code = oldCode;
+      let sequence = 1;
+      while (!code || usedCodes.has(code.toLocaleLowerCase('pt-BR'))) code = `${item.prefix || 'IT'}${String(sequence++).padStart(4, '0')}`;
+      usedCodes.add(code.toLocaleLowerCase('pt-BR'));
+      codes.push(code);
+      if (item.conditions?.[oldCode]) conditions[code] = item.conditions[oldCode];
+    }
+    item.codes = codes;
+    item.conditions = conditions;
+  }
+  return { ...raw, folders, items, history, trash };
 }
 let db = freshDatabase();
 let idb = null;
@@ -167,6 +235,7 @@ function rebuildReservedCodes() {
   reservedCodes = new Set();
   for (const item of db.items) for (const code of item.codes) reservedCodes.add(code.toLocaleLowerCase('pt-BR'));
   for (const event of db.history) for (const code of event.codes || []) reservedCodes.add(String(code).toLocaleLowerCase('pt-BR'));
+  for (const entry of db.trash) for (const item of entry.items || []) for (const code of item.codes || []) reservedCodes.add(String(code).toLocaleLowerCase('pt-BR'));
 }
 
 async function initializeStorage() {
@@ -175,8 +244,15 @@ async function initializeStorage() {
     storageMode = 'indexeddb';
     const saved = await readAllFromIndexedDB();
     if (saved.ready) {
-      db = normalizeDatabase({ folders: saved.folders || [{ id: 'geral', name: 'Geral' }], items: saved.items, history: saved.history, trash: saved.trash });
-      await persistChanges({ folders: true, trash: true });
+      const previous = { folders: saved.folders || [{ id: 'geral', name: 'Geral' }], items: saved.items, history: saved.history, trash: saved.trash };
+      db = normalizeDatabase(previous);
+      if (JSON.stringify(previous) !== JSON.stringify(db)) {
+        try {
+          const backupKey = `${LEGACY_KEY}.backup-before-repair`;
+          if (!localStorage.getItem(backupKey)) localStorage.setItem(backupKey, JSON.stringify(previous));
+        } catch (backupError) { console.warn('Não foi possível guardar a cópia anterior à correção.', backupError); }
+        await replaceAllInIndexedDB(db);
+      }
     } else {
       const legacy = readLegacyDatabase();
       db = legacy || freshDatabase();
@@ -260,14 +336,153 @@ function downloadCsv(filename, rows) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function exportInventoryCsv() {
-  const folderNames = new Map(db.folders.map((folder) => [folder.id, folder.name]));
+function exportRowsForFolder(folderId) {
+  const folder = db.folders.find((entry) => entry.id === folderId);
+  const items = db.items.filter((item) => item.folderId === folderId);
   const rows = [['Código', 'Objeto', 'Estado', 'Pasta', 'Prefixo']];
-  for (const item of db.items) {
-    for (const code of item.codes) rows.push([code, item.name, item.conditions?.[code] || 'Bom', folderNames.get(item.folderId) || 'Geral', item.prefix]);
+  for (const item of items) {
+    if (!item.codes.length) rows.push(['', item.name, 'Sem estoque', folder?.name || 'Geral', item.prefix]);
+    else for (const code of item.codes) rows.push([code, item.name, item.conditions?.[code] || 'Bom', folder?.name || 'Geral', item.prefix]);
   }
-  downloadCsv('estoque-wtc-planilha.csv', rows);
-  toast('Planilha CSV baixada. Abra no Excel ou importe no Google Sheets.');
+  return { folder, items, rows, units: items.reduce((sum, item) => sum + item.codes.length, 0) };
+}
+
+function exportSlug(name) {
+  return String(name || 'geral').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase('pt-BR').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'pasta';
+}
+
+function downloadSpreadsheet(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function makeXlsx(rows) {
+  const encoder = new TextEncoder();
+  const xmlEscape = (value) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+  const columnName = (index) => {
+    let name = '';
+    for (index += 1; index; index = Math.floor((index - 1) / 26)) name = String.fromCharCode(65 + (index - 1) % 26) + name;
+    return name;
+  };
+  const sheetRows = rows.map((row, rowIndex) => `<row r="${rowIndex + 1}">${row.map((value, columnIndex) => {
+    const ref = `${columnName(columnIndex)}${rowIndex + 1}`;
+    return typeof value === 'number' ? `<c r="${ref}" t="n"><v>${value}</v></c>` : `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${xmlEscape(value)}</t></is></c>`;
+  }).join('')}</row>`).join('');
+  const files = {
+    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>',
+    '_rels/.rels': '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+    'xl/workbook.xml': '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Estoque" sheetId="1" r:id="rId1"/></sheets></workbook>',
+    'xl/_rels/workbook.xml.rels': '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>',
+    'xl/worksheets/sheet1.xml': `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${sheetRows}</sheetData></worksheet>`
+  };
+  const write16 = (view, offset, value) => view.setUint16(offset, value, true);
+  const write32 = (view, offset, value) => view.setUint32(offset, value, true);
+  const crc32 = (bytes) => {
+    let crc = -1;
+    for (const byte of bytes) { crc ^= byte; for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0); }
+    return (crc ^ -1) >>> 0;
+  };
+  const localParts = [];
+  const centralParts = [];
+  let localOffset = 0;
+  for (const [name, content] of Object.entries(files)) {
+    const nameBytes = encoder.encode(name);
+    const data = encoder.encode(content);
+    const crc = crc32(data);
+    const local = new Uint8Array(30 + nameBytes.length);
+    const localView = new DataView(local.buffer);
+    write32(localView, 0, 0x04034b50); write16(localView, 4, 20); write16(localView, 6, 0x0800); write16(localView, 8, 0);
+    write32(localView, 14, crc); write32(localView, 18, data.length); write32(localView, 22, data.length); write16(localView, 26, nameBytes.length);
+    local.set(nameBytes, 30);
+    localParts.push(local, data);
+    const central = new Uint8Array(46 + nameBytes.length);
+    const centralView = new DataView(central.buffer);
+    write32(centralView, 0, 0x02014b50); write16(centralView, 4, 20); write16(centralView, 6, 20); write16(centralView, 8, 0x0800); write16(centralView, 10, 0);
+    write32(centralView, 16, crc); write32(centralView, 20, data.length); write32(centralView, 24, data.length); write16(centralView, 28, nameBytes.length); write32(centralView, 42, localOffset);
+    central.set(nameBytes, 46);
+    centralParts.push(central);
+    localOffset += local.length + data.length;
+  }
+  const centralOffset = localOffset;
+  const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  const end = new Uint8Array(22);
+  const endView = new DataView(end.buffer);
+  write32(endView, 0, 0x06054b50); write16(endView, 8, centralParts.length); write16(endView, 10, centralParts.length); write32(endView, 12, centralSize); write32(endView, 16, centralOffset);
+  const parts = [...localParts, ...centralParts, end];
+  return new Blob(parts, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+}
+
+async function copySpreadsheetText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch {
+    const input = document.createElement('textarea');
+    input.value = text;
+    input.style.position = 'fixed';
+    input.style.opacity = '0';
+    document.body.appendChild(input);
+    input.select();
+    const copied = document.execCommand('copy');
+    input.remove();
+    return copied;
+  }
+}
+
+function exportInventoryCsv() {
+  const select = $('#exportFolder');
+  select.innerHTML = db.folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)} · ${formatNumber(db.items.filter((item) => item.folderId === folder.id).length)} itens</option>`).join('');
+  if (db.folders.some((folder) => folder.id === activeFolder)) select.value = activeFolder;
+  $('#exportChooseStep').hidden = false;
+  $('#exportConfirmStep').hidden = true;
+  $('#exportConfirmCheck').checked = false;
+  $('#exportTitle').textContent = 'Escolha o formato';
+  $('#exportSubtitle').textContent = 'Selecione uma pasta e o formato da planilha.';
+  $('#exportDialog').showModal();
+}
+
+function showExportConfirmation() {
+  const folderId = $('#exportFolder').value;
+  const data = exportRowsForFolder(folderId);
+  if (!data.folder) return toast('Escolha uma pasta para exportar.');
+  $('#exportConfirmFolder').textContent = data.folder.name;
+  $('#exportConfirmDetails').textContent = `${formatNumber(data.items.length)} ${data.items.length === 1 ? 'item' : 'itens'} · ${formatNumber(data.units)} ${data.units === 1 ? 'unidade' : 'unidades'} com códigos`;
+  const format = document.querySelector('input[name="exportFormat"]:checked')?.value;
+  $('#exportConfirmNote').textContent = format === 'sheets' ? 'Uma nova planilha Google será aberta. Os dados ficarão copiados para você colar na célula A1.' : 'A exportação contém a pasta completa, inclusive itens sem unidades disponíveis.';
+  $('#exportConfirmCheck').checked = false;
+  $('#exportConfirmBtn').disabled = true;
+  $('#exportChooseStep').hidden = true;
+  $('#exportConfirmStep').hidden = false;
+  $('#exportTitle').textContent = 'Confirme a exportação';
+  $('#exportSubtitle').textContent = 'Revise os dados antes de continuar.';
+}
+
+async function confirmFolderExport() {
+  const data = exportRowsForFolder($('#exportFolder').value);
+  const format = document.querySelector('input[name="exportFormat"]:checked')?.value;
+  if (!data.folder) return;
+  const slug = exportSlug(data.folder.name);
+  const rows = data.rows.map((row) => row.map((value) => typeof value === 'string' && /^\s*[=+@-]/.test(value) ? `'${value}` : value));
+  $('#exportDialog').close();
+  if (format === 'csv') {
+    downloadCsv(`estoque-${slug}.csv`, rows);
+    toast(`Pasta ${data.folder.name} exportada em CSV.`);
+    return;
+  }
+  if (format === 'xlsx') {
+    downloadSpreadsheet(makeXlsx(data.rows), `estoque-${slug}.xlsx`);
+    toast(`Pasta ${data.folder.name} exportada para Excel.`);
+    return;
+  }
+  const sheetWindow = window.open('https://docs.google.com/spreadsheets/create', '_blank');
+  if (sheetWindow) sheetWindow.opener = null;
+  const text = rows.map((row) => row.map((value) => String(value ?? '').replace(/[\t\r\n]+/g, ' ')).join('\t')).join('\r\n');
+  if (await copySpreadsheetText(text)) toast(sheetWindow ? 'Dados copiados. Cole na célula A1 da planilha Google.' : 'Dados copiados. Abra uma planilha Google e cole na célula A1.');
+  else {
+    downloadSpreadsheet(new Blob(['\ufeff', text], { type: 'text/tab-separated-values;charset=utf-8' }), `estoque-${slug}.tsv`);
+    toast('Não foi possível copiar. Baixei os dados em TSV para importar no Google Sheets.');
+  }
 }
 
 async function updateStorageInfo() {
@@ -334,8 +549,13 @@ function historyFolderId(event) {
 
 function folderMovementTotals(folder) {
   return db.history.reduce((totals, event) => {
-    if (historyFolderId(event) !== folder.id) return totals;
     const quantity = Number(event.quantity) || 0;
+    if (event.type === 'transferencia') {
+      if (event.sourceFolderId === folder.id) totals.exits += quantity;
+      if (event.destinationFolderId === folder.id) totals.entries += quantity;
+      return totals;
+    }
+    if (historyFolderId(event) !== folder.id) return totals;
     if (event.type === 'entrada') totals.entries += quantity;
     else if (event.type === 'saida') totals.exits += quantity;
     return totals;
@@ -359,7 +579,7 @@ function render() {
     totalUnits += item.codes.length;
   }
   $('#folderList').innerHTML = db.folders.map((folder) => {
-    return `<div class="folder-entry"><button class="folder-row ${activeFolder === folder.id ? 'active' : ''}" data-folder="${esc(folder.id)}"><i class="folder-dot"></i>${esc(folder.name)}<span class="count">${formatNumber(folderCounts.get(folder.id) || 0)}</span></button>${folder.id === 'geral' ? '' : `<button class="icon-btn folder-delete" type="button" title="Mover pasta para a lixeira" aria-label="Excluir pasta ${esc(folder.name)}" data-delete-folder="${esc(folder.id)}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16M10 11v6m4-6v6M5 7l1 14h12l1-14M9 7V4h6v3"/></svg></button>`}</div>`;
+    return `<div class="folder-entry"><button class="folder-row ${activeFolder === folder.id ? 'active' : ''}" data-folder="${esc(folder.id)}"><i class="folder-dot"></i>${esc(folder.name)}<span class="count">${formatNumber(folderCounts.get(folder.id) || 0)}</span></button>${folderKey(folder.name) === folderKey('Geral') ? '' : `<button class="icon-btn folder-delete" type="button" title="Mover pasta para a lixeira" aria-label="Excluir pasta ${esc(folder.name)}" data-delete-folder="${esc(folder.id)}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16M10 11v6m4-6v6M5 7l1 14h12l1-14M9 7V4h6v3"/></svg></button>`}</div>`;
   }).join('');
   $('#folderFilter').innerHTML = '<option value="all">Todas as pastas</option>' + db.folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)}</option>`).join('');
   $('#folderFilter').value = db.folders.some((folder) => folder.id === previousFilter) || previousFilter === 'all' ? previousFilter : 'all';
@@ -441,13 +661,47 @@ function openMovement(itemId) {
   const item = db.items.find((entry) => entry.id === itemId);
   if (!item) return;
   $('#movementForm').dataset.itemId = itemId;
-  $('#movementItemName').textContent = `${item.name} · ${formatNumber(item.codes.length)} unidade(s) em estoque`;
+  $('#movementItemName').textContent = `${item.name} · ${formatNumber(item.codes.length)} unidade(s) · pasta ${db.folders.find((folder) => folder.id === item.folderId)?.name || 'Geral'}`;
   $('#movementQty').value = '1';
-  $('#movementQty').max = '10000';
   $('#movementNote').value = '';
   $('#movementType').value = 'entrada';
-  $('#movementStockHint').textContent = 'Entrada gera novos códigos; saída remove unidades disponíveis.';
+  updateMovementFields();
   $('#movementDialog').showModal();
+}
+
+function updateMovementFields() {
+  const item = db.items.find((entry) => entry.id === $('#movementForm').dataset.itemId);
+  const isOut = $('#movementType').value === 'saida';
+  const destination = $('#movementDestination');
+  const previous = destination.value;
+  const folders = db.folders.filter((folder) => !isOut || folder.id !== item?.folderId);
+  destination.innerHTML = folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)}</option>`).join('');
+  if (folders.some((folder) => folder.id === previous)) destination.value = previous;
+  else if (!isOut && folders.some((folder) => folder.id === item?.folderId)) destination.value = item.folderId;
+  $('#movementDestinationField').hidden = !isOut;
+  destination.disabled = !folders.length;
+  destination.required = isOut;
+  $('#movementQtyField').hidden = isOut;
+  $('#movementQty').disabled = isOut;
+  $('#movementQty').required = !isOut;
+  $('#movementSubmitBtn').textContent = isOut ? 'Mover para a pasta' : 'Registrar entrada';
+  $('#movementStockHint').textContent = isOut
+    ? `A saída transfere todas as ${formatNumber(item?.codes.length || 0)} unidades para a pasta escolhida e mantém os códigos.`
+    : 'A entrada gera códigos novos na pasta atual.';
+}
+
+function transferItemToFolder(item, destination, notes = '') {
+  const source = db.folders.find((folder) => folder.id === item.folderId);
+  if (!source || !destination || source.id === destination.id) return null;
+  const oldFolderId = item.folderId;
+  const oldStatuses = [...(destination.statuses || [])];
+  for (const status of Object.values(item.conditions || {})) {
+    if (status && status !== 'Bom' && !destination.statuses.some((entry) => entry.toLocaleLowerCase('pt-BR') === status.toLocaleLowerCase('pt-BR'))) destination.statuses.push(status);
+  }
+  const event = { id: makeId(), type: 'transferencia', itemId: item.id, itemName: item.name, prefix: item.prefix, sourceFolderId: source.id, sourceFolderName: source.name, destinationFolderId: destination.id, destinationFolderName: destination.name, folderId: source.id, folderName: source.name, quantity: item.codes.length, codes: [...item.codes], notes, createdAt: new Date().toISOString() };
+  item.folderId = destination.id;
+  db.history.unshift(event);
+  return { event, oldFolderId, oldStatuses, destination };
 }
 
 function printLabels(item) {
@@ -477,7 +731,7 @@ async function moveFolderToTrash(folderId) {
   const index = db.folders.findIndex((folder) => folder.id === folderId);
   if (index < 0) return;
   const folder = db.folders[index];
-  if (folder.id === 'geral') return toast('A pasta Geral não pode ser excluída.');
+  if (folderKey(folder.name) === folderKey('Geral')) return toast('A pasta Geral não pode ser excluída.');
   const items = db.items.filter((item) => item.folderId === folderId);
   if (!confirm(`Mover a pasta “${folder.name}” e ${items.length} ${items.length === 1 ? 'item' : 'itens'} para a lixeira?`)) return;
   const oldItems = db.items;
@@ -502,7 +756,7 @@ async function moveFolderToTrash(folderId) {
 async function restoreFolderFromTrash(entryId) {
   const entry = db.trash.find((row) => row.id === entryId);
   if (!entry) return;
-  if (db.folders.some((folder) => folder.id === entry.folder.id || folder.name.toLocaleLowerCase('pt-BR') === entry.folder.name.toLocaleLowerCase('pt-BR'))) return toast('Já existe uma pasta com esse nome. Exclua a pasta atual antes de restaurar.');
+  if (db.folders.some((folder) => folder.id === entry.folder.id || folderKey(folder.name) === folderKey(entry.folder.name))) return toast('Já existe uma pasta com esse nome. Exclua a pasta atual antes de restaurar.');
   const oldFolders = db.folders;
   const oldItems = db.items;
   const oldTrash = db.trash;
@@ -531,7 +785,17 @@ function renderHistory() {
   historyPage = Math.min(historyPage, pageCount - 1);
   const start = historyPage * HISTORY_PAGE_SIZE;
   const events = db.history.slice(start, start + HISTORY_PAGE_SIZE);
-  $('#historyList').innerHTML = events.length ? events.map((event) => `<div class="history-row"><div class="history-type ${event.type === 'entrada' ? 'in' : 'out'}">${event.type === 'entrada' ? 'Entrada' : 'Saída'}<div class="history-meta">${event.createdAt ? new Date(event.createdAt).toLocaleDateString('pt-BR') : ''}</div></div><div><strong>${esc(event.itemName || 'Item')}</strong><div class="history-meta">${esc(event.notes || event.folderName || 'Sem observação')}</div></div><div class="history-qty">${event.type === 'entrada' ? '+' : '−'}${formatNumber(event.quantity || 0)} un.</div></div>`).join('') : '<div class="empty">Nenhuma movimentação registrada ainda.</div>';
+  $('#historyList').innerHTML = events.length ? events.map((event) => {
+    const transfer = event.type === 'transferencia';
+    const label = transfer ? 'Transferência' : event.type === 'entrada' ? 'Entrada' : 'Saída';
+    const details = transfer
+      ? `De ${event.sourceFolderName || 'pasta'} para ${event.destinationFolderName || 'pasta'}${event.notes ? ` · ${event.notes}` : ''}`
+      : event.type === 'entrada'
+        ? `Destino: ${event.folderName || 'Geral'}${event.notes ? ` · ${event.notes}` : ''}`
+        : `Pasta de origem: ${event.folderName || 'Geral'} · destino não registrado neste histórico antigo${event.notes ? ` · ${event.notes}` : ''}`;
+    const quantity = transfer ? `${formatNumber(event.quantity || 0)} un.` : `${event.type === 'entrada' ? '+' : '−'}${formatNumber(event.quantity || 0)} un.`;
+    return `<div class="history-row"><div class="history-type ${transfer ? 'transfer' : event.type === 'entrada' ? 'in' : 'out'}">${label}<div class="history-meta">${event.createdAt ? new Date(event.createdAt).toLocaleDateString('pt-BR') : ''}</div></div><div><strong>${esc(event.itemName || 'Item')}</strong><div class="history-meta">${esc(details)}</div></div><div class="history-qty">${quantity}</div></div>`;
+  }).join('') : '<div class="empty">Nenhuma movimentação registrada ainda.</div>';
   $('#historyPage').textContent = `Página ${historyPage + 1} de ${pageCount}`;
   $('#historyPrev').disabled = historyPage === 0;
   $('#historyNext').disabled = historyPage >= pageCount - 1;
@@ -601,6 +865,12 @@ async function removeFolderStatus(status) {
 function openBulkMove() {
   const selected = db.items.filter((item) => selectedItemIds.has(item.id));
   if (!selected.length) return toast('Selecione pelo menos um cadastro.');
+  if (db.folders.length < 2) {
+    $('#destinationWarningDialog').dataset.returnMode = 'bulk';
+    $('#destinationWarningDialog').dataset.itemId = '';
+    $('#destinationWarningDialog').showModal();
+    return;
+  }
   $('#bulkMoveDescription').textContent = `${formatNumber(selected.length)} cadastro(s) selecionado(s). Os códigos e as condições serão mantidos.`;
   $('#bulkMoveFolder').innerHTML = db.folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)}</option>`).join('');
   $('#bulkMoveDialog').showModal();
@@ -637,13 +907,27 @@ $('#folderForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   const name = $('#folderName').value.trim();
   if (!name) return;
-  if (db.folders.some((folder) => folder.name.toLocaleLowerCase('pt-BR') === name.toLocaleLowerCase('pt-BR'))) return toast('Já existe uma pasta com esse nome.');
+  if (db.folders.some((folder) => folderKey(folder.name) === folderKey(name))) return toast('Já existe uma pasta com esse nome.');
   const folder = { id: makeId(), name, statuses: [] };
+  const returnMode = $('#folderDialog').dataset.returnMode || '';
+  const returnItemId = $('#folderDialog').dataset.itemId || '';
   db.folders.push(folder);
   activeFolder = folder.id;
   $('#folderDialog').close();
   $('#folderName').value = '';
-  if (await saveChanges({ folders: true }, () => { db.folders = db.folders.filter((row) => row.id !== folder.id); activeFolder = 'all'; })) toast('Pasta criada.');
+  if (await saveChanges({ folders: true }, () => { db.folders = db.folders.filter((row) => row.id !== folder.id); activeFolder = 'all'; })) {
+    toast('Pasta criada.');
+    if (returnMode === 'movement' && $('#movementDialog').open && $('#movementForm').dataset.itemId === returnItemId) {
+      $('#movementType').value = 'saida';
+      updateMovementFields();
+      $('#movementDestination').value = folder.id;
+    } else if (returnMode === 'bulk') {
+      openBulkMove();
+      if ($('#bulkMoveDialog').open) $('#bulkMoveFolder').value = folder.id;
+    }
+  }
+  $('#folderDialog').dataset.returnMode = '';
+  $('#folderDialog').dataset.itemId = '';
 });
 
 $('#folderList').addEventListener('click', (event) => {
@@ -661,7 +945,7 @@ $('#trashList').addEventListener('click', (event) => {
   if (purge) void purgeTrashEntry(purge.dataset.purgeFolder);
 });
 document.querySelector('.sidebar-nav').addEventListener('click', () => { activeFolder = 'all'; currentPage = 0; $('#folderFilter').value = 'all'; render(); });
-$('#addFolderBtn').addEventListener('click', () => { $('#folderDialog').showModal(); $('#folderName').focus(); });
+$('#addFolderBtn').addEventListener('click', () => { $('#folderDialog').dataset.returnMode = ''; $('#folderDialog').dataset.itemId = ''; $('#folderDialog').showModal(); $('#folderName').focus(); });
 $('#trashBtn').addEventListener('click', () => { void openTrash(); });
 $('#itemFolder').addEventListener('change', updateItemFolderSummary);
 $('#newItemBtn').addEventListener('click', openItem);
@@ -705,18 +989,19 @@ $('#bulkMoveForm').addEventListener('submit', async (event) => {
   const selected = db.items.filter((item) => selectedItemIds.has(item.id));
   const moving = selected.filter((item) => item.folderId !== destination);
   if (!moving.length) return toast('Os itens selecionados já estão nessa pasta.');
-  const oldFolders = moving.map((item) => [item, item.folderId]);
   const destinationFolder = db.folders.find((folder) => folder.id === destination);
+  if (!destinationFolder) return toast('Escolha uma pasta de destino existente.');
+  const oldFolders = moving.map((item) => [item, item.folderId]);
   const oldDestinationStatuses = [...(destinationFolder?.statuses || [])];
+  const transfers = [];
   for (const item of moving) {
-    item.folderId = destination;
-    for (const status of Object.values(item.conditions || {})) {
-      if (status && status !== 'Bom' && destinationFolder && !destinationFolder.statuses.some((entry) => entry.toLocaleLowerCase('pt-BR') === status.toLocaleLowerCase('pt-BR'))) destinationFolder.statuses.push(status);
-    }
+    const transfer = transferItemToFolder(item, destinationFolder, 'Transferência em lote');
+    if (transfer) transfers.push(transfer.event);
   }
-  if (await saveChanges({ items: moving, folders: true }, () => {
+  if (await saveChanges({ items: moving, folders: true, history: transfers }, () => {
     for (const [item, folderId] of oldFolders) item.folderId = folderId;
     if (destinationFolder) destinationFolder.statuses = oldDestinationStatuses;
+    db.history = db.history.filter((entry) => !transfers.some((transfer) => transfer.id === entry.id));
   })) {
     selectedItemIds.clear();
     $('#bulkMoveDialog').close();
@@ -794,9 +1079,25 @@ document.body.addEventListener('change', (event) => {
 
 $('#movementType').addEventListener('change', () => {
   const item = db.items.find((entry) => entry.id === $('#movementForm').dataset.itemId);
-  const isOut = $('#movementType').value === 'saida';
-  $('#movementQty').max = isOut ? (item?.codes.length || 0) : 10000;
-  $('#movementStockHint').textContent = isOut ? `Disponível para saída: ${formatNumber(item?.codes.length || 0)} unidade(s).` : 'A entrada cria códigos novos sem reutilizar códigos antigos.';
+  if ($('#movementType').value === 'saida' && !db.folders.some((folder) => folder.id !== item?.folderId)) {
+    $('#destinationWarningDialog').dataset.returnMode = 'movement';
+    $('#destinationWarningDialog').dataset.itemId = item?.id || '';
+    $('#movementType').value = 'entrada';
+    updateMovementFields();
+    $('#destinationWarningDialog').showModal();
+    return;
+  }
+  updateMovementFields();
+});
+$('#movementDestination').addEventListener('change', updateMovementFields);
+$('#createDestinationFolderBtn').addEventListener('click', () => {
+  const warning = $('#destinationWarningDialog');
+  $('#folderDialog').dataset.returnMode = warning.dataset.returnMode || '';
+  $('#folderDialog').dataset.itemId = warning.dataset.itemId || '';
+  warning.close();
+  $('#folderName').value = '';
+  $('#folderDialog').showModal();
+  $('#folderName').focus();
 });
 
 $('#movementForm').addEventListener('submit', async (event) => {
@@ -804,30 +1105,38 @@ $('#movementForm').addEventListener('submit', async (event) => {
   const item = db.items.find((entry) => entry.id === $('#movementForm').dataset.itemId);
   if (!item) return;
   const type = $('#movementType').value;
+  const notes = $('#movementNote').value.trim();
+  if (type === 'saida') {
+    const destination = db.folders.find((folder) => folder.id === $('#movementDestination').value);
+    if (!destination) return toast('Escolha uma pasta de destino existente.');
+    if (destination.id === item.folderId) return toast('Escolha uma pasta diferente da pasta atual.');
+    const source = db.folders.find((folder) => folder.id === item.folderId);
+    if (!confirm(`Mover “${item.name}” e suas ${formatNumber(item.codes.length)} unidades de “${source?.name || 'Geral'}” para “${destination.name}”? Os códigos serão mantidos sem alteração.`)) return;
+    const oldConditions = { ...(item.conditions || {}) };
+    const transfer = transferItemToFolder(item, destination, notes);
+    if (!transfer) return toast('Não foi possível mover este item.');
+    $('#movementDialog').close();
+    if (await saveChanges({ items: [item], folders: true, history: [transfer.event] }, () => {
+      item.folderId = transfer.oldFolderId;
+      item.conditions = oldConditions;
+      destination.statuses = transfer.oldStatuses;
+      db.history = db.history.filter((entry) => entry.id !== transfer.event.id);
+    })) toast('Item movido; os códigos foram mantidos.');
+    return;
+  }
   const quantity = Number($('#movementQty').value);
   if (!Number.isInteger(quantity) || quantity < 1) return toast('Informe uma quantidade válida.');
-  if (type === 'saida' && quantity > item.codes.length) return toast('A quantidade de saída supera o estoque disponível.');
   const oldCodes = [...item.codes];
-  const oldConditions = { ...(item.conditions || {}) };
-  const codes = type === 'entrada' ? nextCodes(item.prefix, quantity) : item.codes.splice(0, quantity);
-  if (type === 'entrada') item.codes.push(...codes);
-  const conditions = {};
-  if (type === 'saida') {
-    item.conditions ||= {};
-    for (const code of codes) {
-      if (item.conditions[code]) conditions[code] = item.conditions[code];
-      delete item.conditions[code];
-    }
-  }
+  const codes = nextCodes(item.prefix, quantity);
+  item.codes.push(...codes);
   const folder = db.folders.find((entry) => entry.id === item.folderId);
-  const movement = { id: makeId(), type, itemId: item.id, folderId: item.folderId, itemName: item.name, prefix: item.prefix, folderName: folder?.name || 'Geral', quantity, codes, conditions, notes: $('#movementNote').value.trim(), createdAt: new Date().toISOString() };
+  const movement = { id: makeId(), type, itemId: item.id, folderId: item.folderId, destinationFolderId: item.folderId, destinationFolderName: folder?.name || 'Geral', itemName: item.name, prefix: item.prefix, folderName: folder?.name || 'Geral', quantity, codes, notes, createdAt: new Date().toISOString() };
   db.history.unshift(movement);
   $('#movementDialog').close();
   if (await saveChanges({ items: [item], history: [movement] }, () => {
     item.codes = oldCodes;
-    item.conditions = oldConditions;
     db.history = db.history.filter((entry) => entry.id !== movement.id);
-  })) toast(type === 'entrada' ? 'Entrada registrada.' : 'Saída registrada.');
+  })) toast('Entrada registrada.');
 });
 
 $('#historyBtn').addEventListener('click', () => { historyPage = 0; renderHistory(); $('#historyDialog').showModal(); });
@@ -871,5 +1180,15 @@ $('#exportBtn').addEventListener('click', () => {
 });
 
 $('#sheetExportBtn').addEventListener('click', exportInventoryCsv);
+$('#exportContinueBtn').addEventListener('click', showExportConfirmation);
+$('#exportBackBtn').addEventListener('click', () => {
+  $('#exportConfirmStep').hidden = true;
+  $('#exportChooseStep').hidden = false;
+  $('#exportTitle').textContent = 'Escolha o formato';
+  $('#exportSubtitle').textContent = 'Selecione uma pasta e o formato da planilha.';
+});
+$('#exportConfirmCheck').addEventListener('change', (event) => { $('#exportConfirmBtn').disabled = !event.target.checked; });
+$('#exportConfirmBtn').addEventListener('click', () => { if ($('#exportConfirmCheck').checked) void confirmFolderExport(); });
 
 initializeStorage();
+
