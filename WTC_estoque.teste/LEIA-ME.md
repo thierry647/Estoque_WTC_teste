@@ -24,6 +24,7 @@ O servidor fica apenas no seu computador. Não é necessário instalar pacotes n
 8. Use **Importar** para restaurar um arquivo JSON exportado anteriormente. A importação substitui o estoque atual e pede confirmação.
 9. Exclua uma pasta pelo ícone de lixeira. A pasta e seus itens ficam recuperáveis por 30 dias; a lixeira permite restaurar ou apagar definitivamente.
 10. Use **Exportar em planilhas** para escolher uma pasta e exportar todos os seus itens como Planilha Google, Excel (`.xlsx`) ou CSV. A exportação pede confirmação da pasta completa. A opção Planilha Google abre uma planilha nova e prepara os dados copiados para colar na célula A1. **Cópia JSON** salva uma cópia completa para backup ou restauração, incluindo o histórico.
+11. Na tela inicial, abra **Bloco econômico** para definir preços por item e uma observação por pasta. O total acompanha as quantidades do estoque; itens sem preço ficam fora da soma até que recebam um valor. Você também pode aplicar o mesmo preço unitário a todos os itens da pasta e revisar antes de salvar. No estoque, o botão **Ver etiqueta** mostra o resumo salvo sem permitir alterações. Ao exportar uma pasta com etiqueta, escolha se quer incluir os preços e a observação.
 
 Os dados são salvos automaticamente no IndexedDB deste navegador e dispositivo. Para transferi-los entre computadores ou manter uma cópia de segurança, use **Cópia JSON** e depois **Importar** no outro navegador. Apagar os dados do navegador pode apagar o estoque salvo.
 
@@ -40,4 +41,3 @@ Para uma pessoa usando um computador, a versão local pode ser suficiente. Uma A
 ## Abrir no VS Code
 
 Abra o VS Code, escolha **Arquivo → Abrir Pasta…** e selecione esta pasta. O sistema é um site estático em `index.html`; para usar, abra esse arquivo no navegador.
-
