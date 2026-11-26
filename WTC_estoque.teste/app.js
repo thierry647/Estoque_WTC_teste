@@ -12,6 +12,8 @@ const esc = (value) => String(value).replace(/[&<>"']/g, (char) => ({
 }[char]));
 const makeId = () => crypto.randomUUID ? crypto.randomUUID() : `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
 const formatNumber = (value) => new Intl.NumberFormat('pt-BR').format(value);
+const formatMoney = (cents) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format((Number(cents) || 0) / 100);
+const parseMoney = (value) => { const raw = String(value ?? '').trim().replace(/^R\$\s*/i, ''); if (!raw) return null; const amount = Number(raw.includes(',') ? raw.replace(/\./g, '').replace(',', '.') : raw); return Number.isFinite(amount) && amount >= 0 ? Math.round(amount * 100) : NaN; };
 
 function cleanFolderStatuses(statuses) {
   const seen = new Set();
@@ -21,6 +23,10 @@ function cleanFolderStatuses(statuses) {
     seen.add(key);
     return true;
   });
+}
+
+function folderKey(name) {
+  return String(name || '').trim().replace(/\s+/g, ' ').normalize('NFKC').toLocaleLowerCase('pt-BR');
 }
 
 function cleanTrash(entries) {
@@ -43,7 +49,7 @@ function cleanTrash(entries) {
 }
 
 function freshDatabase() {
-  return { folders: [{ id: 'geral', name: 'Geral', statuses: [] }], items: [], history: [], trash: [] };
+  return { folders: [{ id: 'geral', name: 'Geral', statuses: [], priceLabel: null }], items: [], history: [], trash: [] };
 }
 
 function normalizeDatabase(raw) {
@@ -51,21 +57,65 @@ function normalizeDatabase(raw) {
   const oldItems = Array.isArray(raw?.items) ? raw.items : raw?.itens;
   if (!Array.isArray(oldFolders) || !Array.isArray(oldItems)) throw new Error('Arquivo de estoque inválido.');
 
-  const folders = oldFolders
-    .map((folder) => ({ id: String(folder.id || makeId()), name: String(folder.name || folder.nome || '').trim(), statuses: cleanFolderStatuses(folder.statuses) }))
-    .filter((folder) => folder.name);
-  if (!folders.length) folders.push({ id: 'geral', name: 'Geral', statuses: [] });
-  const folderIdsByName = new Map(folders.map((folder) => [folder.name.toLocaleLowerCase('pt-BR'), folder.id]));
+  const folders = [];
+  const folderIds = new Map();
+  const foldersByName = new Map();
+  const folderIdsUsed = new Set();
+  for (const source of oldFolders) {
+    const name = String(source?.name || source?.nome || '').trim();
+    if (!name) continue;
+    const key = folderKey(name);
+    let folder = foldersByName.get(key);
+    if (!folder) {
+      let id = String(source.id || makeId());
+      if (folderIdsUsed.has(id)) id = makeId();
+      folderIdsUsed.add(id);
+      folder = { id, name, statuses: [], priceLabel: null };
+      folders.push(folder);
+      foldersByName.set(key, folder);
+    }
+    folder.statuses = cleanFolderStatuses([...folder.statuses, ...(Array.isArray(source.statuses) ? source.statuses : [])]);
+    if (source.priceLabel && typeof source.priceLabel === 'object') folder.priceLabel = { observation: String(source.priceLabel.observation || '').slice(0, 240), updatedAt: source.priceLabel.updatedAt || null };
+    if (source.id && !folderIds.has(String(source.id))) folderIds.set(String(source.id), folder.id);
+  }
+  let general = foldersByName.get(folderKey('Geral'));
+  if (!general) {
+    general = { id: folderIdsUsed.has('geral') ? makeId() : 'geral', name: 'Geral', statuses: [], priceLabel: null };
+    folders.unshift(general);
+    foldersByName.set(folderKey('Geral'), general);
+    folderIdsUsed.add(general.id);
+  }
 
+  const usedCodes = new Set();
+  const usedItemIds = new Set();
   const items = oldItems.map((item) => {
     const name = String(item.name || item.nome || '').trim();
     const prefix = String(item.prefix || item.prefixo || '').trim();
-    const codes = Array.isArray(item.codes) ? item.codes.map(String) : Array.isArray(item.codigos) ? item.codigos.map(String) : [];
-    const folderId = item.folderId || folderIdsByName.get(String(item.pasta || 'Geral').toLocaleLowerCase('pt-BR')) || folders[0].id;
     if (!name || !prefix) throw new Error('Há um item sem nome ou prefixo.');
+    const requestedFolderId = folderIds.get(String(item.folderId || ''));
+    const folder = folders.find((entry) => entry.id === requestedFolderId)
+      || foldersByName.get(folderKey(item.pasta))
+      || general;
     const conditions = item.conditions && typeof item.conditions === 'object' ? { ...item.conditions } : {};
     if (item.unitStates && typeof item.unitStates === 'object') for (const [code, state] of Object.entries(item.unitStates)) conditions[code] ||= state;
-    return { id: String(item.id || makeId()), name, prefix, folderId, codes, conditions };
+    const sourceCodes = Array.isArray(item.codes) ? item.codes : Array.isArray(item.codigos) ? item.codigos : [];
+    const codes = [];
+    const normalizedConditions = {};
+    for (const sourceCode of sourceCodes) {
+      const originalCode = String(sourceCode).trim();
+      if (!originalCode) continue;
+      let code = originalCode;
+      let sequence = 1;
+      while (usedCodes.has(code.toLocaleLowerCase('pt-BR'))) code = prefix + String(sequence++).padStart(4, '0');
+      usedCodes.add(code.toLocaleLowerCase('pt-BR'));
+      codes.push(code);
+      if (conditions[originalCode]) normalizedConditions[code] = conditions[originalCode];
+    }
+    let id = String(item.id || makeId());
+    if (usedItemIds.has(id)) id = makeId();
+    usedItemIds.add(id);
+    const unitPriceCents = Number(item.unitPriceCents);
+    return { id, name, prefix, folderId: folder.id, codes, conditions: normalizedConditions, ...(Number.isSafeInteger(unitPriceCents) && unitPriceCents >= 0 ? { unitPriceCents } : {}) };
   });
 
   for (const item of items) {
@@ -76,13 +126,36 @@ function normalizeDatabase(raw) {
       if (name && name.toLocaleLowerCase('pt-BR') !== 'bom' && !folder.statuses.some((entry) => entry.toLocaleLowerCase('pt-BR') === name.toLocaleLowerCase('pt-BR'))) folder.statuses.push(name);
     }
   }
-
-  return { folders, items, history: Array.isArray(raw.history) ? raw.history : [], trash: cleanTrash(raw.trash) };
+  const history = (Array.isArray(raw.history) ? raw.history : []).map((event) => {
+    if (!event || typeof event !== 'object') return event;
+    const folderId = folderIds.get(String(event.folderId || '')) || foldersByName.get(folderKey(event.folderName))?.id;
+    const sourceFolderId = folderIds.get(String(event.sourceFolderId || '')) || foldersByName.get(folderKey(event.sourceFolderName))?.id;
+    const destinationFolderId = folderIds.get(String(event.destinationFolderId || '')) || foldersByName.get(folderKey(event.destinationFolderName))?.id;
+    return { ...event, ...(folderId ? { folderId } : {}), ...(sourceFolderId ? { sourceFolderId } : {}), ...(destinationFolderId ? { destinationFolderId } : {}) };
+  });
+  const trash = cleanTrash(raw.trash);
+  for (const entry of trash) for (const item of entry.items) {
+    const codes = [];
+    const conditions = {};
+    for (const originalCode of item.codes) {
+      const oldCode = String(originalCode).trim();
+      let code = oldCode;
+      let sequence = 1;
+      while (!code || usedCodes.has(code.toLocaleLowerCase('pt-BR'))) code = `${item.prefix || 'IT'}${String(sequence++).padStart(4, '0')}`;
+      usedCodes.add(code.toLocaleLowerCase('pt-BR'));
+      codes.push(code);
+      if (item.conditions?.[oldCode]) conditions[code] = item.conditions[oldCode];
+    }
+    item.codes = codes;
+    item.conditions = conditions;
+  }
+  return { ...raw, folders, items, history, trash };
 }
 let db = freshDatabase();
 let idb = null;
 let storageMode = 'indexeddb';
 let activeFolder = 'all';
+const priceDrafts = new Map();
 let currentPage = 0;
 let historyPage = 0;
 let codePage = 0;
@@ -91,6 +164,15 @@ let selectedItemIds = new Set();
 let visibleItemIds = [];
 let searchTimer = 0;
 const conditionSaveTimers = new WeakMap();
+
+function folderPriceSummary(folderId) {
+  const folder = db.folders.find((entry) => entry.id === folderId);
+  const items = db.items.filter((entry) => entry.folderId === folderId);
+  const priced = items.filter((item) => Number.isSafeInteger(item.unitPriceCents) && item.unitPriceCents >= 0);
+  const missing = items.filter((item) => !Number.isSafeInteger(item.unitPriceCents) || item.unitPriceCents < 0);
+  const totalCents = priced.reduce((sum, item) => sum + item.unitPriceCents * item.codes.length, 0);
+  return { folder, items, priced, missing, totalCents, units: items.reduce((sum, item) => sum + item.codes.length, 0) };
+}
 
 function requestResult(request) {
   return new Promise((resolve, reject) => {
@@ -167,6 +249,7 @@ function rebuildReservedCodes() {
   reservedCodes = new Set();
   for (const item of db.items) for (const code of item.codes) reservedCodes.add(code.toLocaleLowerCase('pt-BR'));
   for (const event of db.history) for (const code of event.codes || []) reservedCodes.add(String(code).toLocaleLowerCase('pt-BR'));
+  for (const entry of db.trash) for (const item of entry.items || []) for (const code of item.codes || []) reservedCodes.add(String(code).toLocaleLowerCase('pt-BR'));
 }
 
 async function initializeStorage() {
@@ -175,8 +258,15 @@ async function initializeStorage() {
     storageMode = 'indexeddb';
     const saved = await readAllFromIndexedDB();
     if (saved.ready) {
-      db = normalizeDatabase({ folders: saved.folders || [{ id: 'geral', name: 'Geral' }], items: saved.items, history: saved.history, trash: saved.trash });
-      await persistChanges({ folders: true, trash: true });
+      const previous = { folders: saved.folders || [{ id: 'geral', name: 'Geral' }], items: saved.items, history: saved.history, trash: saved.trash };
+      db = normalizeDatabase(previous);
+      if (JSON.stringify(previous) !== JSON.stringify(db)) {
+        try {
+          const backupKey = `${LEGACY_KEY}.backup-before-repair`;
+          if (!localStorage.getItem(backupKey)) localStorage.setItem(backupKey, JSON.stringify(previous));
+        } catch (backupError) { console.warn('Não foi possível guardar a cópia anterior à correção.', backupError); }
+        await replaceAllInIndexedDB(db);
+      }
     } else {
       const legacy = readLegacyDatabase();
       db = legacy || freshDatabase();
@@ -194,6 +284,7 @@ async function initializeStorage() {
   }
   rebuildReservedCodes();
   render();
+  if (!$('#pricingModule').hidden) renderPricingModule($('#priceFolderSelect').value);
   void updateStorageInfo();
 }
 
@@ -260,14 +351,173 @@ function downloadCsv(filename, rows) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function exportInventoryCsv() {
-  const folderNames = new Map(db.folders.map((folder) => [folder.id, folder.name]));
-  const rows = [['Código', 'Objeto', 'Estado', 'Pasta', 'Prefixo']];
-  for (const item of db.items) {
-    for (const code of item.codes) rows.push([code, item.name, item.conditions?.[code] || 'Bom', folderNames.get(item.folderId) || 'Geral', item.prefix]);
+function exportRowsForFolder(folderId, includePriceLabel = false) {
+  const folder = db.folders.find((entry) => entry.id === folderId);
+  const items = db.items.filter((item) => item.folderId === folderId);
+  const rows = [['Código', 'Objeto', 'Estado', 'Pasta', 'Prefixo', ...(includePriceLabel ? ['Preço unitário (R$)'] : [])]];
+  for (const item of items) {
+    const price = Number.isSafeInteger(item.unitPriceCents) ? item.unitPriceCents / 100 : '';
+    if (!item.codes.length) rows.push(['', item.name, 'Sem estoque', folder?.name || 'Geral', item.prefix, ...(includePriceLabel ? [price] : [])]);
+    else for (const code of item.codes) rows.push([code, item.name, item.conditions?.[code] || 'Bom', folder?.name || 'Geral', item.prefix, ...(includePriceLabel ? [price] : [])]);
   }
-  downloadCsv('estoque-wtc-planilha.csv', rows);
-  toast('Planilha CSV baixada. Abra no Excel ou importe no Google Sheets.');
+  const priceSummary = folderPriceSummary(folderId);
+  if (includePriceLabel && folder?.priceLabel) rows.push([], ['Etiqueta do Bloco econômico', folder.name], ['Total atual da pasta', priceSummary.totalCents / 100], ['Observação', folder.priceLabel.observation || '—'], ['Itens sem preço', priceSummary.missing.length]);
+  return { folder, items, rows, units: items.reduce((sum, item) => sum + item.codes.length, 0), priceSummary };
+}
+
+function exportSlug(name) {
+  return String(name || 'geral').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase('pt-BR').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'pasta';
+}
+
+function downloadSpreadsheet(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function makeXlsx(rows) {
+  const encoder = new TextEncoder();
+  const xmlEscape = (value) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+  const columnName = (index) => {
+    let name = '';
+    for (index += 1; index; index = Math.floor((index - 1) / 26)) name = String.fromCharCode(65 + (index - 1) % 26) + name;
+    return name;
+  };
+  const sheetRows = rows.map((row, rowIndex) => `<row r="${rowIndex + 1}">${row.map((value, columnIndex) => {
+    const ref = `${columnName(columnIndex)}${rowIndex + 1}`;
+    return typeof value === 'number' ? `<c r="${ref}" t="n"><v>${value}</v></c>` : `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${xmlEscape(value)}</t></is></c>`;
+  }).join('')}</row>`).join('');
+  const files = {
+    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>',
+    '_rels/.rels': '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+    'xl/workbook.xml': '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Estoque" sheetId="1" r:id="rId1"/></sheets></workbook>',
+    'xl/_rels/workbook.xml.rels': '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>',
+    'xl/worksheets/sheet1.xml': `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${sheetRows}</sheetData></worksheet>`
+  };
+  const write16 = (view, offset, value) => view.setUint16(offset, value, true);
+  const write32 = (view, offset, value) => view.setUint32(offset, value, true);
+  const crc32 = (bytes) => {
+    let crc = -1;
+    for (const byte of bytes) { crc ^= byte; for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0); }
+    return (crc ^ -1) >>> 0;
+  };
+  const localParts = [];
+  const centralParts = [];
+  let localOffset = 0;
+  for (const [name, content] of Object.entries(files)) {
+    const nameBytes = encoder.encode(name);
+    const data = encoder.encode(content);
+    const crc = crc32(data);
+    const local = new Uint8Array(30 + nameBytes.length);
+    const localView = new DataView(local.buffer);
+    write32(localView, 0, 0x04034b50); write16(localView, 4, 20); write16(localView, 6, 0x0800); write16(localView, 8, 0);
+    write32(localView, 14, crc); write32(localView, 18, data.length); write32(localView, 22, data.length); write16(localView, 26, nameBytes.length);
+    local.set(nameBytes, 30);
+    localParts.push(local, data);
+    const central = new Uint8Array(46 + nameBytes.length);
+    const centralView = new DataView(central.buffer);
+    write32(centralView, 0, 0x02014b50); write16(centralView, 4, 20); write16(centralView, 6, 20); write16(centralView, 8, 0x0800); write16(centralView, 10, 0);
+    write32(centralView, 16, crc); write32(centralView, 20, data.length); write32(centralView, 24, data.length); write16(centralView, 28, nameBytes.length); write32(centralView, 42, localOffset);
+    central.set(nameBytes, 46);
+    centralParts.push(central);
+    localOffset += local.length + data.length;
+  }
+  const centralOffset = localOffset;
+  const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  const end = new Uint8Array(22);
+  const endView = new DataView(end.buffer);
+  write32(endView, 0, 0x06054b50); write16(endView, 8, centralParts.length); write16(endView, 10, centralParts.length); write32(endView, 12, centralSize); write32(endView, 16, centralOffset);
+  const parts = [...localParts, ...centralParts, end];
+  return new Blob(parts, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+}
+
+async function copySpreadsheetText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch {
+    const input = document.createElement('textarea');
+    input.value = text;
+    input.style.position = 'fixed';
+    input.style.opacity = '0';
+    document.body.appendChild(input);
+    input.select();
+    const copied = document.execCommand('copy');
+    input.remove();
+    return copied;
+  }
+}
+
+function updateExportLabelChoice() {
+  let choice = $('#exportLabelChoice');
+  if (!choice) {
+    choice = document.createElement('label');
+    choice.id = 'exportLabelChoice';
+    choice.className = 'export-label-choice';
+    choice.innerHTML = '<input type="checkbox" id="exportIncludeLabel"><span><strong>Incluir o Bloco econômico</strong><small>Acrescenta preços, total da pasta e observação à exportação.</small></span>';
+    $('#exportFolder').closest('.field').after(choice);
+  }
+  const folder = db.folders.find((entry) => entry.id === $('#exportFolder').value);
+  choice.hidden = !folder?.priceLabel;
+  $('#exportIncludeLabel').checked = Boolean(folder?.priceLabel);
+}
+
+function exportInventoryCsv() {
+  const select = $('#exportFolder');
+  if (!select.dataset.priceLabelBound) { select.addEventListener('change', updateExportLabelChoice); select.dataset.priceLabelBound = '1'; }
+  select.innerHTML = db.folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)} · ${formatNumber(db.items.filter((item) => item.folderId === folder.id).length)} itens</option>`).join('');
+  if (db.folders.some((folder) => folder.id === activeFolder)) select.value = activeFolder;
+  updateExportLabelChoice();
+  $('#exportChooseStep').hidden = false;
+  $('#exportConfirmStep').hidden = true;
+  $('#exportConfirmCheck').checked = false;
+  $('#exportTitle').textContent = 'Escolha o formato';
+  $('#exportSubtitle').textContent = 'Selecione uma pasta e o formato da planilha.';
+  $('#exportDialog').showModal();
+}
+
+function showExportConfirmation() {
+  const folderId = $('#exportFolder').value;
+  const includeLabel = Boolean($('#exportIncludeLabel')?.checked);
+  const data = exportRowsForFolder(folderId, includeLabel);
+  if (!data.folder) return toast('Escolha uma pasta para exportar.');
+  $('#exportConfirmFolder').textContent = data.folder.name;
+  $('#exportConfirmDetails').textContent = `${formatNumber(data.items.length)} ${data.items.length === 1 ? 'item' : 'itens'} · ${formatNumber(data.units)} ${data.units === 1 ? 'unidade' : 'unidades'} com códigos${includeLabel ? ` · total ${formatMoney(data.priceSummary.totalCents)}` : ''}`;
+  const format = document.querySelector('input[name="exportFormat"]:checked')?.value;
+  $('#exportConfirmNote').textContent = format === 'sheets' ? `Uma nova planilha Google será aberta. Os dados ficarão copiados para você colar na célula A1.${includeLabel ? ' Preços, total e observação do Bloco econômico também serão incluídos.' : ''}` : `A exportação contém a pasta completa, inclusive itens sem unidades disponíveis${includeLabel ? ' e os dados do Bloco econômico' : ''}.`;
+  $('#exportConfirmCheck').checked = false;
+  $('#exportConfirmBtn').disabled = true;
+  $('#exportChooseStep').hidden = true;
+  $('#exportConfirmStep').hidden = false;
+  $('#exportTitle').textContent = 'Confirme a exportação';
+  $('#exportSubtitle').textContent = 'Revise os dados antes de continuar.';
+}
+
+async function confirmFolderExport() {
+  const data = exportRowsForFolder($('#exportFolder').value, Boolean($('#exportIncludeLabel')?.checked));
+  const format = document.querySelector('input[name="exportFormat"]:checked')?.value;
+  if (!data.folder) return;
+  const slug = exportSlug(data.folder.name);
+  const rows = data.rows.map((row) => row.map((value) => typeof value === 'string' && /^\s*[=+@-]/.test(value) ? `'${value}` : value));
+  $('#exportDialog').close();
+  if (format === 'csv') {
+    downloadCsv(`estoque-${slug}.csv`, rows);
+    toast(`Pasta ${data.folder.name} exportada em CSV.`);
+    return;
+  }
+  if (format === 'xlsx') {
+    downloadSpreadsheet(makeXlsx(data.rows), `estoque-${slug}.xlsx`);
+    toast(`Pasta ${data.folder.name} exportada para Excel.`);
+    return;
+  }
+  const sheetWindow = window.open('https://docs.google.com/spreadsheets/create', '_blank');
+  if (sheetWindow) sheetWindow.opener = null;
+  const text = rows.map((row) => row.map((value) => String(value ?? '').replace(/[\t\r\n]+/g, ' ')).join('\t')).join('\r\n');
+  if (await copySpreadsheetText(text)) toast(sheetWindow ? 'Dados copiados. Cole na célula A1 da planilha Google.' : 'Dados copiados. Abra uma planilha Google e cole na célula A1.');
+  else {
+    downloadSpreadsheet(new Blob(['\ufeff', text], { type: 'text/tab-separated-values;charset=utf-8' }), `estoque-${slug}.tsv`);
+    toast('Não foi possível copiar. Baixei os dados em TSV para importar no Google Sheets.');
+  }
 }
 
 async function updateStorageInfo() {
@@ -334,8 +584,13 @@ function historyFolderId(event) {
 
 function folderMovementTotals(folder) {
   return db.history.reduce((totals, event) => {
-    if (historyFolderId(event) !== folder.id) return totals;
     const quantity = Number(event.quantity) || 0;
+    if (event.type === 'transferencia') {
+      if (event.sourceFolderId === folder.id) totals.exits += quantity;
+      if (event.destinationFolderId === folder.id) totals.entries += quantity;
+      return totals;
+    }
+    if (historyFolderId(event) !== folder.id) return totals;
     if (event.type === 'entrada') totals.entries += quantity;
     else if (event.type === 'saida') totals.exits += quantity;
     return totals;
@@ -359,7 +614,7 @@ function render() {
     totalUnits += item.codes.length;
   }
   $('#folderList').innerHTML = db.folders.map((folder) => {
-    return `<div class="folder-entry"><button class="folder-row ${activeFolder === folder.id ? 'active' : ''}" data-folder="${esc(folder.id)}"><i class="folder-dot"></i>${esc(folder.name)}<span class="count">${formatNumber(folderCounts.get(folder.id) || 0)}</span></button>${folder.id === 'geral' ? '' : `<button class="icon-btn folder-delete" type="button" title="Mover pasta para a lixeira" aria-label="Excluir pasta ${esc(folder.name)}" data-delete-folder="${esc(folder.id)}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16M10 11v6m4-6v6M5 7l1 14h12l1-14M9 7V4h6v3"/></svg></button>`}</div>`;
+    return `<div class="folder-entry"><button class="folder-row ${activeFolder === folder.id ? 'active' : ''}" data-folder="${esc(folder.id)}"><i class="folder-dot"></i>${esc(folder.name)}<span class="count">${formatNumber(folderCounts.get(folder.id) || 0)}</span></button>${folderKey(folder.name) === folderKey('Geral') ? '' : `<button class="icon-btn folder-delete" type="button" title="Mover pasta para a lixeira" aria-label="Excluir pasta ${esc(folder.name)}" data-delete-folder="${esc(folder.id)}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16M10 11v6m4-6v6M5 7l1 14h12l1-14M9 7V4h6v3"/></svg></button>`}</div>`;
   }).join('');
   $('#folderFilter').innerHTML = '<option value="all">Todas as pastas</option>' + db.folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)}</option>`).join('');
   $('#folderFilter').value = db.folders.some((folder) => folder.id === previousFilter) || previousFilter === 'all' ? previousFilter : 'all';
@@ -388,6 +643,12 @@ function render() {
   const title = folder ? folder.name : 'Todos os itens';
   $('#pageTitle').textContent = title;
   $('#crumbText').textContent = title;
+  const labelCard = $('#folderLabelCard');
+  if (folder?.priceLabel) {
+    const summary = folderPriceSummary(folder.id);
+    labelCard.hidden = false;
+    labelCard.innerHTML = `<div><div class="folder-label-kicker">Bloco econômico</div><h2>Etiqueta de ${esc(folder.name)}</h2><p>${summary.missing.length ? `${summary.missing.length} ${summary.missing.length === 1 ? 'item sem preço' : 'itens sem preço'} · ` : ''}${esc(folder.priceLabel.observation || 'Etiqueta salva')}</p></div><div class="folder-label-actions"><strong class="folder-label-total">${formatMoney(summary.totalCents)}</strong><button class="btn" type="button" data-show-price-label="${esc(folder.id)}">Ver etiqueta</button></div>`;
+  } else labelCard.hidden = true;
 
   const query = $('#searchInput').value.trim().toLocaleLowerCase('pt-BR');
   const folderFilter = $('#folderFilter').value;
@@ -427,6 +688,109 @@ function render() {
   $('#selectedCount').textContent = `${formatNumber(selectedItemIds.size)} selecionados`;
 }
 
+function priceDraftFor(folderId) {
+  if (!priceDrafts.has(folderId)) {
+    const summary = folderPriceSummary(folderId);
+    priceDrafts.set(folderId, { prices: Object.fromEntries(summary.items.filter((item) => Number.isSafeInteger(item.unitPriceCents) && item.unitPriceCents >= 0).map((item) => [item.id, (item.unitPriceCents / 100).toFixed(2).replace('.', ',')])), observation: summary.folder?.priceLabel?.observation || '' });
+  }
+  return priceDrafts.get(folderId);
+}
+
+function refreshPricePreview() {
+  const summary = folderPriceSummary($('#priceFolderSelect').value);
+  let total = 0;
+  let missing = 0;
+  for (const item of summary.items) {
+    const input = document.querySelector(`[data-price-item="${CSS.escape(item.id)}"]`);
+    const cents = parseMoney(input?.value ?? '');
+    if (cents === null || Number.isNaN(cents)) missing += 1;
+    else total += cents * item.codes.length;
+  }
+  $('#priceFolderTotal').textContent = formatMoney(total);
+  $('#priceMissingNote').textContent = missing ? `${formatNumber(missing)} ${missing === 1 ? 'item sem preço' : 'itens sem preço'}; não entra no total.` : 'Todos os itens têm preço.';
+}
+
+function renderPricingModule(folderId) {
+  const select = $('#priceFolderSelect');
+  if (!db.folders.length) { $('#pricingEditor').hidden = true; $('#pricingNoFolder').hidden = false; return; }
+  $('#pricingEditor').hidden = false;
+  $('#pricingNoFolder').hidden = true;
+  const previous = folderId || select.value;
+  select.innerHTML = db.folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)} · ${formatNumber(db.items.filter((item) => item.folderId === folder.id).length)} itens</option>`).join('');
+  select.value = db.folders.some((folder) => folder.id === previous) ? previous : db.folders[0].id;
+  const id = select.value;
+  const summary = folderPriceSummary(id);
+  const draft = priceDraftFor(id);
+  $('#priceItems').innerHTML = summary.items.length ? summary.items.map((item) => {
+    const value = draft.prices[item.id] ?? '';
+    return `<div class="price-item-row"><div><div class="price-item-name">${esc(item.name)}</div><div class="price-item-meta">${esc(item.prefix)} · ${formatNumber(item.codes.length)} ${item.codes.length === 1 ? 'unidade' : 'unidades'}${value.trim() === '' ? ' · sem preço cadastrado' : ''}</div></div><label class="price-input-wrap"><span>R$</span><input class="price-input" type="text" inputmode="decimal" placeholder="Sem preço" aria-label="Preço unitário de ${esc(item.name)}" data-price-item="${esc(item.id)}" value="${esc(value)}"></label></div>`;
+  }).join('') : '<div class="empty">Esta pasta ainda não tem itens cadastrados.</div>';
+  $('#priceObservation').value = draft.observation;
+  $('#bulkPrice').value = '';
+  refreshPricePreview();
+}
+
+function applyBulkPrice() {
+  const folderId = $('#priceFolderSelect').value;
+  const summary = folderPriceSummary(folderId);
+  const raw = $('#bulkPrice').value.trim();
+  const cents = parseMoney(raw);
+  if (!summary.folder) return toast('Crie uma pasta antes de cadastrar preços.');
+  if (!summary.items.length) return toast('Adicione itens à pasta antes de aplicar um preço.');
+  if (!raw || Number.isNaN(cents)) { toast('Informe um preço válido, como 12,50.'); $('#bulkPrice').focus(); return; }
+  const normalized = (cents / 100).toFixed(2).replace('.', ',');
+  const draft = priceDraftFor(folderId);
+  document.querySelectorAll('[data-price-item]').forEach((input) => { input.value = normalized; draft.prices[input.dataset.priceItem] = normalized; });
+  refreshPricePreview();
+  toast(`Preço aplicado a ${summary.items.length} ${summary.items.length === 1 ? 'item' : 'itens'}. Salve a etiqueta para confirmar.`);
+}
+
+async function savePriceLabel() {
+  const folderId = $('#priceFolderSelect').value;
+  const summary = folderPriceSummary(folderId);
+  if (!summary.folder) return toast('Crie uma pasta antes de cadastrar uma etiqueta.');
+  const draft = priceDraftFor(folderId);
+  draft.prices = {};
+  for (const input of document.querySelectorAll('[data-price-item]')) {
+    const value = input.value.trim();
+    const cents = parseMoney(value);
+    if (value && Number.isNaN(cents)) { toast('Confira os preços. Use, por exemplo, 12,50.'); input.focus(); return; }
+    if (value) draft.prices[input.dataset.priceItem] = value;
+  }
+  draft.observation = $('#priceObservation').value.trim();
+  const previousItems = summary.items.map((item) => ({ ...item, codes: [...item.codes], conditions: { ...(item.conditions || {}) } }));
+  const previousLabel = summary.folder.priceLabel;
+  summary.items.forEach((item) => {
+    const raw = draft.prices[item.id];
+    const cents = raw === undefined ? null : parseMoney(raw);
+    if (cents === null) delete item.unitPriceCents; else item.unitPriceCents = cents;
+  });
+  summary.folder.priceLabel = { observation: draft.observation, updatedAt: new Date().toISOString() };
+  const saved = await saveChanges({ folders: true, items: summary.items }, () => {
+    summary.items.forEach((item, index) => { delete item.unitPriceCents; Object.assign(item, previousItems[index]); });
+    summary.folder.priceLabel = previousLabel;
+  });
+  if (saved) { priceDrafts.delete(folderId); renderPricingModule(folderId); toast('Etiqueta e preços salvos.'); }
+}
+
+function showPriceLabel(folderId) {
+  const folder = db.folders.find((entry) => entry.id === folderId);
+  if (!folder?.priceLabel) return;
+  const summary = folderPriceSummary(folderId);
+  $('#priceLabelTitle').textContent = `Etiqueta · ${folder.name}`;
+  $('#viewPriceTotal').innerHTML = `Total atual da pasta<strong>${formatMoney(summary.totalCents)}</strong>`;
+  $('#viewPriceItems').innerHTML = summary.items.length ? summary.items.map((item) => {
+    const unit = Number.isSafeInteger(item.unitPriceCents) ? formatMoney(item.unitPriceCents) : 'Sem preço';
+    const line = Number.isSafeInteger(item.unitPriceCents) ? formatMoney(item.unitPriceCents * item.codes.length) : '—';
+    return `<div class="price-label-item"><span>${esc(item.name)} · ${formatNumber(item.codes.length)} un. × ${unit}</span><span>${line}</span></div>`;
+  }).join('') : '<div class="empty">Esta pasta não tem itens cadastrados.</div>';
+  $('#viewPriceNote').textContent = folder.priceLabel.observation || 'Sem observação.';
+  const warning = $('#viewPriceWarning');
+  warning.hidden = !summary.missing.length;
+  warning.textContent = summary.missing.length ? `${summary.missing.length} ${summary.missing.length === 1 ? 'item está sem preço' : 'itens estão sem preço'} e não entra no total.` : '';
+  $('#priceLabelDialog').showModal();
+}
+
 function openItem() {
   $('#itemName').value = '';
   $('#itemQty').value = '1';
@@ -441,13 +805,47 @@ function openMovement(itemId) {
   const item = db.items.find((entry) => entry.id === itemId);
   if (!item) return;
   $('#movementForm').dataset.itemId = itemId;
-  $('#movementItemName').textContent = `${item.name} · ${formatNumber(item.codes.length)} unidade(s) em estoque`;
+  $('#movementItemName').textContent = `${item.name} · ${formatNumber(item.codes.length)} unidade(s) · pasta ${db.folders.find((folder) => folder.id === item.folderId)?.name || 'Geral'}`;
   $('#movementQty').value = '1';
-  $('#movementQty').max = '10000';
   $('#movementNote').value = '';
   $('#movementType').value = 'entrada';
-  $('#movementStockHint').textContent = 'Entrada gera novos códigos; saída remove unidades disponíveis.';
+  updateMovementFields();
   $('#movementDialog').showModal();
+}
+
+function updateMovementFields() {
+  const item = db.items.find((entry) => entry.id === $('#movementForm').dataset.itemId);
+  const isOut = $('#movementType').value === 'saida';
+  const destination = $('#movementDestination');
+  const previous = destination.value;
+  const folders = db.folders.filter((folder) => !isOut || folder.id !== item?.folderId);
+  destination.innerHTML = folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)}</option>`).join('');
+  if (folders.some((folder) => folder.id === previous)) destination.value = previous;
+  else if (!isOut && folders.some((folder) => folder.id === item?.folderId)) destination.value = item.folderId;
+  $('#movementDestinationField').hidden = !isOut;
+  destination.disabled = !folders.length;
+  destination.required = isOut;
+  $('#movementQtyField').hidden = isOut;
+  $('#movementQty').disabled = isOut;
+  $('#movementQty').required = !isOut;
+  $('#movementSubmitBtn').textContent = isOut ? 'Mover para a pasta' : 'Registrar entrada';
+  $('#movementStockHint').textContent = isOut
+    ? `A saída transfere todas as ${formatNumber(item?.codes.length || 0)} unidades para a pasta escolhida e mantém os códigos.`
+    : 'A entrada gera códigos novos na pasta atual.';
+}
+
+function transferItemToFolder(item, destination, notes = '') {
+  const source = db.folders.find((folder) => folder.id === item.folderId);
+  if (!source || !destination || source.id === destination.id) return null;
+  const oldFolderId = item.folderId;
+  const oldStatuses = [...(destination.statuses || [])];
+  for (const status of Object.values(item.conditions || {})) {
+    if (status && status !== 'Bom' && !destination.statuses.some((entry) => entry.toLocaleLowerCase('pt-BR') === status.toLocaleLowerCase('pt-BR'))) destination.statuses.push(status);
+  }
+  const event = { id: makeId(), type: 'transferencia', itemId: item.id, itemName: item.name, prefix: item.prefix, sourceFolderId: source.id, sourceFolderName: source.name, destinationFolderId: destination.id, destinationFolderName: destination.name, folderId: source.id, folderName: source.name, quantity: item.codes.length, codes: [...item.codes], notes, createdAt: new Date().toISOString() };
+  item.folderId = destination.id;
+  db.history.unshift(event);
+  return { event, oldFolderId, oldStatuses, destination };
 }
 
 function printLabels(item) {
@@ -477,7 +875,7 @@ async function moveFolderToTrash(folderId) {
   const index = db.folders.findIndex((folder) => folder.id === folderId);
   if (index < 0) return;
   const folder = db.folders[index];
-  if (folder.id === 'geral') return toast('A pasta Geral não pode ser excluída.');
+  if (folderKey(folder.name) === folderKey('Geral')) return toast('A pasta Geral não pode ser excluída.');
   const items = db.items.filter((item) => item.folderId === folderId);
   if (!confirm(`Mover a pasta “${folder.name}” e ${items.length} ${items.length === 1 ? 'item' : 'itens'} para a lixeira?`)) return;
   const oldItems = db.items;
@@ -502,7 +900,7 @@ async function moveFolderToTrash(folderId) {
 async function restoreFolderFromTrash(entryId) {
   const entry = db.trash.find((row) => row.id === entryId);
   if (!entry) return;
-  if (db.folders.some((folder) => folder.id === entry.folder.id || folder.name.toLocaleLowerCase('pt-BR') === entry.folder.name.toLocaleLowerCase('pt-BR'))) return toast('Já existe uma pasta com esse nome. Exclua a pasta atual antes de restaurar.');
+  if (db.folders.some((folder) => folder.id === entry.folder.id || folderKey(folder.name) === folderKey(entry.folder.name))) return toast('Já existe uma pasta com esse nome. Exclua a pasta atual antes de restaurar.');
   const oldFolders = db.folders;
   const oldItems = db.items;
   const oldTrash = db.trash;
@@ -531,7 +929,17 @@ function renderHistory() {
   historyPage = Math.min(historyPage, pageCount - 1);
   const start = historyPage * HISTORY_PAGE_SIZE;
   const events = db.history.slice(start, start + HISTORY_PAGE_SIZE);
-  $('#historyList').innerHTML = events.length ? events.map((event) => `<div class="history-row"><div class="history-type ${event.type === 'entrada' ? 'in' : 'out'}">${event.type === 'entrada' ? 'Entrada' : 'Saída'}<div class="history-meta">${event.createdAt ? new Date(event.createdAt).toLocaleDateString('pt-BR') : ''}</div></div><div><strong>${esc(event.itemName || 'Item')}</strong><div class="history-meta">${esc(event.notes || event.folderName || 'Sem observação')}</div></div><div class="history-qty">${event.type === 'entrada' ? '+' : '−'}${formatNumber(event.quantity || 0)} un.</div></div>`).join('') : '<div class="empty">Nenhuma movimentação registrada ainda.</div>';
+  $('#historyList').innerHTML = events.length ? events.map((event) => {
+    const transfer = event.type === 'transferencia';
+    const label = transfer ? 'Transferência' : event.type === 'entrada' ? 'Entrada' : 'Saída';
+    const details = transfer
+      ? `De ${event.sourceFolderName || 'pasta'} para ${event.destinationFolderName || 'pasta'}${event.notes ? ` · ${event.notes}` : ''}`
+      : event.type === 'entrada'
+        ? `Destino: ${event.folderName || 'Geral'}${event.notes ? ` · ${event.notes}` : ''}`
+        : `Pasta de origem: ${event.folderName || 'Geral'} · destino não registrado neste histórico antigo${event.notes ? ` · ${event.notes}` : ''}`;
+    const quantity = transfer ? `${formatNumber(event.quantity || 0)} un.` : `${event.type === 'entrada' ? '+' : '−'}${formatNumber(event.quantity || 0)} un.`;
+    return `<div class="history-row"><div class="history-type ${transfer ? 'transfer' : event.type === 'entrada' ? 'in' : 'out'}">${label}<div class="history-meta">${event.createdAt ? new Date(event.createdAt).toLocaleDateString('pt-BR') : ''}</div></div><div><strong>${esc(event.itemName || 'Item')}</strong><div class="history-meta">${esc(details)}</div></div><div class="history-qty">${quantity}</div></div>`;
+  }).join('') : '<div class="empty">Nenhuma movimentação registrada ainda.</div>';
   $('#historyPage').textContent = `Página ${historyPage + 1} de ${pageCount}`;
   $('#historyPrev').disabled = historyPage === 0;
   $('#historyNext').disabled = historyPage >= pageCount - 1;
@@ -601,6 +1009,12 @@ async function removeFolderStatus(status) {
 function openBulkMove() {
   const selected = db.items.filter((item) => selectedItemIds.has(item.id));
   if (!selected.length) return toast('Selecione pelo menos um cadastro.');
+  if (db.folders.length < 2) {
+    $('#destinationWarningDialog').dataset.returnMode = 'bulk';
+    $('#destinationWarningDialog').dataset.itemId = '';
+    $('#destinationWarningDialog').showModal();
+    return;
+  }
   $('#bulkMoveDescription').textContent = `${formatNumber(selected.length)} cadastro(s) selecionado(s). Os códigos e as condições serão mantidos.`;
   $('#bulkMoveFolder').innerHTML = db.folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)}</option>`).join('');
   $('#bulkMoveDialog').showModal();
@@ -637,13 +1051,27 @@ $('#folderForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   const name = $('#folderName').value.trim();
   if (!name) return;
-  if (db.folders.some((folder) => folder.name.toLocaleLowerCase('pt-BR') === name.toLocaleLowerCase('pt-BR'))) return toast('Já existe uma pasta com esse nome.');
+  if (db.folders.some((folder) => folderKey(folder.name) === folderKey(name))) return toast('Já existe uma pasta com esse nome.');
   const folder = { id: makeId(), name, statuses: [] };
+  const returnMode = $('#folderDialog').dataset.returnMode || '';
+  const returnItemId = $('#folderDialog').dataset.itemId || '';
   db.folders.push(folder);
   activeFolder = folder.id;
   $('#folderDialog').close();
   $('#folderName').value = '';
-  if (await saveChanges({ folders: true }, () => { db.folders = db.folders.filter((row) => row.id !== folder.id); activeFolder = 'all'; })) toast('Pasta criada.');
+  if (await saveChanges({ folders: true }, () => { db.folders = db.folders.filter((row) => row.id !== folder.id); activeFolder = 'all'; })) {
+    toast('Pasta criada.');
+    if (returnMode === 'movement' && $('#movementDialog').open && $('#movementForm').dataset.itemId === returnItemId) {
+      $('#movementType').value = 'saida';
+      updateMovementFields();
+      $('#movementDestination').value = folder.id;
+    } else if (returnMode === 'bulk') {
+      openBulkMove();
+      if ($('#bulkMoveDialog').open) $('#bulkMoveFolder').value = folder.id;
+    }
+  }
+  $('#folderDialog').dataset.returnMode = '';
+  $('#folderDialog').dataset.itemId = '';
 });
 
 $('#folderList').addEventListener('click', (event) => {
@@ -661,7 +1089,20 @@ $('#trashList').addEventListener('click', (event) => {
   if (purge) void purgeTrashEntry(purge.dataset.purgeFolder);
 });
 document.querySelector('.sidebar-nav').addEventListener('click', () => { activeFolder = 'all'; currentPage = 0; $('#folderFilter').value = 'all'; render(); });
-$('#addFolderBtn').addEventListener('click', () => { $('#folderDialog').showModal(); $('#folderName').focus(); });
+$('#priceFolderSelect').addEventListener('change', (event) => renderPricingModule(event.target.value));
+$('#applyBulkPrice').addEventListener('click', applyBulkPrice);
+$('#pricingModule').addEventListener('input', (event) => {
+  const draft = priceDraftFor($('#priceFolderSelect').value);
+  if (event.target.matches('[data-price-item]')) draft.prices[event.target.dataset.priceItem] = event.target.value;
+  if (event.target.id === 'priceObservation') draft.observation = event.target.value;
+  refreshPricePreview();
+});
+$('#savePriceLabelBtn').addEventListener('click', () => { void savePriceLabel(); });
+$('#cancelPriceChangesBtn').addEventListener('click', () => { const id = $('#priceFolderSelect').value; priceDrafts.delete(id); renderPricingModule(id); toast('Alterações descartadas.'); });
+$('#backToStockBtn').addEventListener('click', () => { $('#pricingModule').hidden = true; $('.shell').hidden = false; $('.shell').inert = false; render(); });
+$('#sidebarPricingBtn').addEventListener('click', () => { $('.shell').hidden = true; $('#pricingModule').hidden = false; renderPricingModule(); (db.folders.length ? $('#priceFolderSelect') : $('#goCreatePricingFolder')).focus(); });
+$('#goCreatePricingFolder').addEventListener('click', () => { $('#pricingModule').hidden = true; $('.shell').hidden = false; $('.shell').inert = false; activeFolder = 'all'; render(); $('#folderDialog').showModal(); $('#folderName').focus(); });
+$('#addFolderBtn').addEventListener('click', () => { $('#folderDialog').dataset.returnMode = ''; $('#folderDialog').dataset.itemId = ''; $('#folderDialog').showModal(); $('#folderName').focus(); });
 $('#trashBtn').addEventListener('click', () => { void openTrash(); });
 $('#itemFolder').addEventListener('change', updateItemFolderSummary);
 $('#newItemBtn').addEventListener('click', openItem);
@@ -705,18 +1146,19 @@ $('#bulkMoveForm').addEventListener('submit', async (event) => {
   const selected = db.items.filter((item) => selectedItemIds.has(item.id));
   const moving = selected.filter((item) => item.folderId !== destination);
   if (!moving.length) return toast('Os itens selecionados já estão nessa pasta.');
-  const oldFolders = moving.map((item) => [item, item.folderId]);
   const destinationFolder = db.folders.find((folder) => folder.id === destination);
+  if (!destinationFolder) return toast('Escolha uma pasta de destino existente.');
+  const oldFolders = moving.map((item) => [item, item.folderId]);
   const oldDestinationStatuses = [...(destinationFolder?.statuses || [])];
+  const transfers = [];
   for (const item of moving) {
-    item.folderId = destination;
-    for (const status of Object.values(item.conditions || {})) {
-      if (status && status !== 'Bom' && destinationFolder && !destinationFolder.statuses.some((entry) => entry.toLocaleLowerCase('pt-BR') === status.toLocaleLowerCase('pt-BR'))) destinationFolder.statuses.push(status);
-    }
+    const transfer = transferItemToFolder(item, destinationFolder, 'Transferência em lote');
+    if (transfer) transfers.push(transfer.event);
   }
-  if (await saveChanges({ items: moving, folders: true }, () => {
+  if (await saveChanges({ items: moving, folders: true, history: transfers }, () => {
     for (const [item, folderId] of oldFolders) item.folderId = folderId;
     if (destinationFolder) destinationFolder.statuses = oldDestinationStatuses;
+    db.history = db.history.filter((entry) => !transfers.some((transfer) => transfer.id === entry.id));
   })) {
     selectedItemIds.clear();
     $('#bulkMoveDialog').close();
@@ -728,6 +1170,8 @@ $('#bulkMoveForm').addEventListener('submit', async (event) => {
 document.body.addEventListener('click', async (event) => {
   const close = event.target.closest('[data-close]');
   if (close) { $('#' + close.dataset.close).close(); return; }
+  const priceLabelButton = event.target.closest('[data-show-price-label]');
+  if (priceLabelButton) { showPriceLabel(priceLabelButton.dataset.showPriceLabel); return; }
   const codeButton = event.target.closest('[data-codes]');
   if (codeButton) {
     const item = db.items.find((entry) => entry.id === codeButton.dataset.codes);
@@ -794,9 +1238,25 @@ document.body.addEventListener('change', (event) => {
 
 $('#movementType').addEventListener('change', () => {
   const item = db.items.find((entry) => entry.id === $('#movementForm').dataset.itemId);
-  const isOut = $('#movementType').value === 'saida';
-  $('#movementQty').max = isOut ? (item?.codes.length || 0) : 10000;
-  $('#movementStockHint').textContent = isOut ? `Disponível para saída: ${formatNumber(item?.codes.length || 0)} unidade(s).` : 'A entrada cria códigos novos sem reutilizar códigos antigos.';
+  if ($('#movementType').value === 'saida' && !db.folders.some((folder) => folder.id !== item?.folderId)) {
+    $('#destinationWarningDialog').dataset.returnMode = 'movement';
+    $('#destinationWarningDialog').dataset.itemId = item?.id || '';
+    $('#movementType').value = 'entrada';
+    updateMovementFields();
+    $('#destinationWarningDialog').showModal();
+    return;
+  }
+  updateMovementFields();
+});
+$('#movementDestination').addEventListener('change', updateMovementFields);
+$('#createDestinationFolderBtn').addEventListener('click', () => {
+  const warning = $('#destinationWarningDialog');
+  $('#folderDialog').dataset.returnMode = warning.dataset.returnMode || '';
+  $('#folderDialog').dataset.itemId = warning.dataset.itemId || '';
+  warning.close();
+  $('#folderName').value = '';
+  $('#folderDialog').showModal();
+  $('#folderName').focus();
 });
 
 $('#movementForm').addEventListener('submit', async (event) => {
@@ -804,30 +1264,38 @@ $('#movementForm').addEventListener('submit', async (event) => {
   const item = db.items.find((entry) => entry.id === $('#movementForm').dataset.itemId);
   if (!item) return;
   const type = $('#movementType').value;
+  const notes = $('#movementNote').value.trim();
+  if (type === 'saida') {
+    const destination = db.folders.find((folder) => folder.id === $('#movementDestination').value);
+    if (!destination) return toast('Escolha uma pasta de destino existente.');
+    if (destination.id === item.folderId) return toast('Escolha uma pasta diferente da pasta atual.');
+    const source = db.folders.find((folder) => folder.id === item.folderId);
+    if (!confirm(`Mover “${item.name}” e suas ${formatNumber(item.codes.length)} unidades de “${source?.name || 'Geral'}” para “${destination.name}”? Os códigos serão mantidos sem alteração.`)) return;
+    const oldConditions = { ...(item.conditions || {}) };
+    const transfer = transferItemToFolder(item, destination, notes);
+    if (!transfer) return toast('Não foi possível mover este item.');
+    $('#movementDialog').close();
+    if (await saveChanges({ items: [item], folders: true, history: [transfer.event] }, () => {
+      item.folderId = transfer.oldFolderId;
+      item.conditions = oldConditions;
+      destination.statuses = transfer.oldStatuses;
+      db.history = db.history.filter((entry) => entry.id !== transfer.event.id);
+    })) toast('Item movido; os códigos foram mantidos.');
+    return;
+  }
   const quantity = Number($('#movementQty').value);
   if (!Number.isInteger(quantity) || quantity < 1) return toast('Informe uma quantidade válida.');
-  if (type === 'saida' && quantity > item.codes.length) return toast('A quantidade de saída supera o estoque disponível.');
   const oldCodes = [...item.codes];
-  const oldConditions = { ...(item.conditions || {}) };
-  const codes = type === 'entrada' ? nextCodes(item.prefix, quantity) : item.codes.splice(0, quantity);
-  if (type === 'entrada') item.codes.push(...codes);
-  const conditions = {};
-  if (type === 'saida') {
-    item.conditions ||= {};
-    for (const code of codes) {
-      if (item.conditions[code]) conditions[code] = item.conditions[code];
-      delete item.conditions[code];
-    }
-  }
+  const codes = nextCodes(item.prefix, quantity);
+  item.codes.push(...codes);
   const folder = db.folders.find((entry) => entry.id === item.folderId);
-  const movement = { id: makeId(), type, itemId: item.id, folderId: item.folderId, itemName: item.name, prefix: item.prefix, folderName: folder?.name || 'Geral', quantity, codes, conditions, notes: $('#movementNote').value.trim(), createdAt: new Date().toISOString() };
+  const movement = { id: makeId(), type, itemId: item.id, folderId: item.folderId, destinationFolderId: item.folderId, destinationFolderName: folder?.name || 'Geral', itemName: item.name, prefix: item.prefix, folderName: folder?.name || 'Geral', quantity, codes, notes, createdAt: new Date().toISOString() };
   db.history.unshift(movement);
   $('#movementDialog').close();
   if (await saveChanges({ items: [item], history: [movement] }, () => {
     item.codes = oldCodes;
-    item.conditions = oldConditions;
     db.history = db.history.filter((entry) => entry.id !== movement.id);
-  })) toast(type === 'entrada' ? 'Entrada registrada.' : 'Saída registrada.');
+  })) toast('Entrada registrada.');
 });
 
 $('#historyBtn').addEventListener('click', () => { historyPage = 0; renderHistory(); $('#historyDialog').showModal(); });
@@ -871,5 +1339,27 @@ $('#exportBtn').addEventListener('click', () => {
 });
 
 $('#sheetExportBtn').addEventListener('click', exportInventoryCsv);
+$('#exportContinueBtn').addEventListener('click', showExportConfirmation);
+$('#exportBackBtn').addEventListener('click', () => {
+  $('#exportConfirmStep').hidden = true;
+  $('#exportChooseStep').hidden = false;
+  $('#exportTitle').textContent = 'Escolha o formato';
+  $('#exportSubtitle').textContent = 'Selecione uma pasta e o formato da planilha.';
+});
+$('#exportConfirmCheck').addEventListener('change', (event) => { $('#exportConfirmBtn').disabled = !event.target.checked; });
+$('#exportConfirmBtn').addEventListener('click', () => { if ($('#exportConfirmCheck').checked) void confirmFolderExport(); });
 
 initializeStorage();
+const welcomeScreen = $('#welcomeScreen');
+const appShell = $('.shell');
+const pricingModule = $('#pricingModule');
+appShell.inert = true;
+const leaveWelcome = () => { welcomeScreen.classList.add('is-leaving'); setTimeout(() => welcomeScreen.remove(), 600); };
+const openModule = (module) => {
+  if (module === 'pricing') { appShell.hidden = true; pricingModule.hidden = false; renderPricingModule(); (db.folders.length ? $('#priceFolderSelect') : $('#goCreatePricingFolder')).focus(); }
+  else { pricingModule.hidden = true; appShell.hidden = false; appShell.inert = false; }
+  leaveWelcome();
+};
+$('#openStockModule').addEventListener('click', () => openModule('stock'));
+$('#openPricingModule').addEventListener('click', () => openModule('pricing'));
+$('#openStockModule').focus();

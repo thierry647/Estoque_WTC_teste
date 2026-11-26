@@ -1,6 +1,6 @@
 # Estoque WTC
 
-Sistema local para organizar itens em pastas, acompanhar entradas e saídas e gerar um código individual para cada unidade. A interface usa JavaScript e salva os dados no IndexedDB do navegador.
+Sistema local para organizar itens em pastas, acompanhar entradas, transferências e gerar um código individual para cada unidade. A interface usa JavaScript e salva os dados no IndexedDB do navegador.
 
 ## Como abrir
 
@@ -17,15 +17,16 @@ O servidor fica apenas no seu computador. Não é necessário instalar pacotes n
 1. Clique em **Criar pasta** para separar os itens, por exemplo: Ferramentas, Cozinha ou Eletrônicos.
 2. Clique em **Adicionar item**, informe o nome, a quantidade e a pasta. Esse cadastro inicial também aparece como uma entrada no histórico.
 3. O sistema sugere um prefixo com base nas consoantes do nome. Para “Faca”, sugere `Fc`. Você pode editar o prefixo antes de salvar.
-4. Clique em **Códigos e estado** para consultar os códigos gerados para cada unidade ou imprimir etiquetas. Para 7 facas com prefixo `Fc`, a sequência será `Fc0001` a `Fc0007`.
-5. Use **Entrada / Saída** para registrar reposições e retiradas. Ao selecionar uma pasta, o resumo mostra unidades atuais, entradas e saídas acumuladas. O sistema impede saídas maiores que o saldo e não reutiliza códigos de unidades que já saíram.
-6. Em **Códigos e estado**, cada código tem um estado individual. Adicione estados personalizados para a pasta, como `Quebrado` ou `Enferrujado`, e escolha o estado de cada unidade. A lista é independente por pasta; excluir um estado retorna as unidades marcadas para `Bom`.
-7. Marque os itens e use **Mover para uma pasta** para mudar vários cadastros de pasta de uma vez.
+4. Clique em **Códigos e estado** para consultar os códigos de cada unidade ou imprimir etiquetas. Para 7 facas com prefixo `Fc`, a sequência será `Fc0001` a `Fc0007`.
+5. Use **Entrada / Saída** para registrar reposições e transferir itens. Uma entrada cria novos códigos na pasta atual. Uma saída transfere todas as unidades do item para outra pasta existente, preservando seus códigos e registrando a saída e a entrada no histórico. Se ainda não houver pasta de destino, crie uma para continuar.
+6. Em **Códigos e estado**, cada código tem um estado individual. Adicione estados personalizados para a pasta, como `Quebrado` ou `Enferrujado`, e escolha o estado de cada unidade. A lista é independente por pasta.
+7. Marque os itens e use **Mover para uma pasta** para transferir vários cadastros. Os códigos e estados acompanham os itens, e cada transferência fica registrada no histórico.
 8. Use **Importar** para restaurar um arquivo JSON exportado anteriormente. A importação substitui o estoque atual e pede confirmação.
 9. Exclua uma pasta pelo ícone de lixeira. A pasta e seus itens ficam recuperáveis por 30 dias; a lixeira permite restaurar ou apagar definitivamente.
-10. Use a busca e os filtros para localizar itens. **Planilha CSV** baixa uma linha por unidade, com código, objeto, estado e pasta. O arquivo abre no Excel; no Google Sheets, escolha **Arquivo → Importar → Fazer upload** e selecione o CSV. **Cópia JSON** também salva o histórico para backup ou restauração.
+10. Use **Exportar em planilhas** para escolher uma pasta e exportar todos os seus itens como Planilha Google, Excel (`.xlsx`) ou CSV. A exportação pede confirmação da pasta completa. A opção Planilha Google abre uma planilha nova e prepara os dados copiados para colar na célula A1. **Cópia JSON** salva uma cópia completa para backup ou restauração, incluindo o histórico.
+11. Na tela inicial, abra **Bloco econômico** para definir preços por item e uma observação por pasta. O total acompanha as quantidades do estoque; itens sem preço ficam fora da soma até que recebam um valor. Você também pode aplicar o mesmo preço unitário a todos os itens da pasta e revisar antes de salvar. No estoque, o botão **Ver etiqueta** mostra o resumo salvo sem permitir alterações. Ao exportar uma pasta com etiqueta, escolha se quer incluir os preços e a observação.
 
-Os dados são salvos automaticamente no IndexedDB deste navegador e dispositivo. Para transferi-los entre computadores ou manter uma cópia de segurança, use **Exportar** e depois **Importar** no outro navegador. Apagar os dados do navegador pode apagar o estoque salvo.
+Os dados são salvos automaticamente no IndexedDB deste navegador e dispositivo. Para transferi-los entre computadores ou manter uma cópia de segurança, use **Cópia JSON** e depois **Importar** no outro navegador. Apagar os dados do navegador pode apagar o estoque salvo.
 
 O sistema migra automaticamente os dados antigos de `localStorage` quando os encontra na mesma origem. `file://` e `http://localhost:8000` podem usar armazenamentos separados; se houver dados na versão antiga, exporte uma cópia antes de mudar o jeito de abrir e importe-a depois.
 
@@ -40,7 +41,3 @@ Para uma pessoa usando um computador, a versão local pode ser suficiente. Uma A
 ## Abrir no VS Code
 
 Abra o VS Code, escolha **Arquivo → Abrir Pasta…** e selecione esta pasta. O sistema é um site estático em `index.html`; para usar, abra esse arquivo no navegador.
-
-## Publicar no GitHub
-
-O repositório local precisa de um repositório remoto no GitHub para receber `git push`. No VS Code, entre na sua conta GitHub, abra **Controle do Código-Fonte** e use **Publicar no GitHub**. Escolha privado ou público conforme desejar. Depois, o botão de sincronização envia os commits para esse repositório.
