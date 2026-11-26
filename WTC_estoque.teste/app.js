@@ -12,8 +12,6 @@ const esc = (value) => String(value).replace(/[&<>"']/g, (char) => ({
 }[char]));
 const makeId = () => crypto.randomUUID ? crypto.randomUUID() : `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
 const formatNumber = (value) => new Intl.NumberFormat('pt-BR').format(value);
-const formatMoney = (cents) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format((Number(cents) || 0) / 100);
-const parseMoney = (value) => { const raw = String(value ?? '').trim().replace(/^R\$\s*/i, ''); if (!raw) return null; const amount = Number(raw.includes(',') ? raw.replace(/\./g, '').replace(',', '.') : raw); return Number.isFinite(amount) && amount >= 0 ? Math.round(amount * 100) : NaN; };
 
 function cleanFolderStatuses(statuses) {
   const seen = new Set();
@@ -49,7 +47,7 @@ function cleanTrash(entries) {
 }
 
 function freshDatabase() {
-  return { folders: [{ id: 'geral', name: 'Geral', statuses: [], priceLabel: null }], items: [], history: [], trash: [] };
+  return { folders: [{ id: 'geral', name: 'Geral', statuses: [] }], items: [], history: [], trash: [] };
 }
 
 function normalizeDatabase(raw) {
@@ -70,17 +68,16 @@ function normalizeDatabase(raw) {
       let id = String(source.id || makeId());
       if (folderIdsUsed.has(id)) id = makeId();
       folderIdsUsed.add(id);
-      folder = { id, name, statuses: [], priceLabel: null };
+      folder = { id, name, statuses: [] };
       folders.push(folder);
       foldersByName.set(key, folder);
     }
     folder.statuses = cleanFolderStatuses([...folder.statuses, ...(Array.isArray(source.statuses) ? source.statuses : [])]);
-    if (source.priceLabel && typeof source.priceLabel === 'object') folder.priceLabel = { observation: String(source.priceLabel.observation || '').slice(0, 240), updatedAt: source.priceLabel.updatedAt || null };
     if (source.id && !folderIds.has(String(source.id))) folderIds.set(String(source.id), folder.id);
   }
   let general = foldersByName.get(folderKey('Geral'));
   if (!general) {
-    general = { id: folderIdsUsed.has('geral') ? makeId() : 'geral', name: 'Geral', statuses: [], priceLabel: null };
+    general = { id: folderIdsUsed.has('geral') ? makeId() : 'geral', name: 'Geral', statuses: [] };
     folders.unshift(general);
     foldersByName.set(folderKey('Geral'), general);
     folderIdsUsed.add(general.id);
@@ -114,8 +111,7 @@ function normalizeDatabase(raw) {
     let id = String(item.id || makeId());
     if (usedItemIds.has(id)) id = makeId();
     usedItemIds.add(id);
-    const unitPriceCents = Number(item.unitPriceCents);
-    return { id, name, prefix, folderId: folder.id, codes, conditions: normalizedConditions, ...(Number.isSafeInteger(unitPriceCents) && unitPriceCents >= 0 ? { unitPriceCents } : {}) };
+    return { id, name, prefix, folderId: folder.id, codes, conditions: normalizedConditions };
   });
 
   for (const item of items) {
@@ -155,7 +151,6 @@ let db = freshDatabase();
 let idb = null;
 let storageMode = 'indexeddb';
 let activeFolder = 'all';
-const priceDrafts = new Map();
 let currentPage = 0;
 let historyPage = 0;
 let codePage = 0;
@@ -164,15 +159,6 @@ let selectedItemIds = new Set();
 let visibleItemIds = [];
 let searchTimer = 0;
 const conditionSaveTimers = new WeakMap();
-
-function folderPriceSummary(folderId) {
-  const folder = db.folders.find((entry) => entry.id === folderId);
-  const items = db.items.filter((entry) => entry.folderId === folderId);
-  const priced = items.filter((item) => Number.isSafeInteger(item.unitPriceCents) && item.unitPriceCents >= 0);
-  const missing = items.filter((item) => !Number.isSafeInteger(item.unitPriceCents) || item.unitPriceCents < 0);
-  const totalCents = priced.reduce((sum, item) => sum + item.unitPriceCents * item.codes.length, 0);
-  return { folder, items, priced, missing, totalCents, units: items.reduce((sum, item) => sum + item.codes.length, 0) };
-}
 
 function requestResult(request) {
   return new Promise((resolve, reject) => {
@@ -284,7 +270,6 @@ async function initializeStorage() {
   }
   rebuildReservedCodes();
   render();
-  if (!$('#pricingModule').hidden) renderPricingModule($('#priceFolderSelect').value);
   void updateStorageInfo();
 }
 
@@ -351,18 +336,15 @@ function downloadCsv(filename, rows) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function exportRowsForFolder(folderId, includePriceLabel = false) {
+function exportRowsForFolder(folderId) {
   const folder = db.folders.find((entry) => entry.id === folderId);
   const items = db.items.filter((item) => item.folderId === folderId);
-  const rows = [['Código', 'Objeto', 'Estado', 'Pasta', 'Prefixo', ...(includePriceLabel ? ['Preço unitário (R$)'] : [])]];
+  const rows = [['Código', 'Objeto', 'Estado', 'Pasta', 'Prefixo']];
   for (const item of items) {
-    const price = Number.isSafeInteger(item.unitPriceCents) ? item.unitPriceCents / 100 : '';
-    if (!item.codes.length) rows.push(['', item.name, 'Sem estoque', folder?.name || 'Geral', item.prefix, ...(includePriceLabel ? [price] : [])]);
-    else for (const code of item.codes) rows.push([code, item.name, item.conditions?.[code] || 'Bom', folder?.name || 'Geral', item.prefix, ...(includePriceLabel ? [price] : [])]);
+    if (!item.codes.length) rows.push(['', item.name, 'Sem estoque', folder?.name || 'Geral', item.prefix]);
+    else for (const code of item.codes) rows.push([code, item.name, item.conditions?.[code] || 'Bom', folder?.name || 'Geral', item.prefix]);
   }
-  const priceSummary = folderPriceSummary(folderId);
-  if (includePriceLabel && folder?.priceLabel) rows.push([], ['Etiqueta do Bloco econômico', folder.name], ['Total atual da pasta', priceSummary.totalCents / 100], ['Observação', folder.priceLabel.observation || '—'], ['Itens sem preço', priceSummary.missing.length]);
-  return { folder, items, rows, units: items.reduce((sum, item) => sum + item.codes.length, 0), priceSummary };
+  return { folder, items, rows, units: items.reduce((sum, item) => sum + item.codes.length, 0) };
 }
 
 function exportSlug(name) {
@@ -448,26 +430,10 @@ async function copySpreadsheetText(text) {
   }
 }
 
-function updateExportLabelChoice() {
-  let choice = $('#exportLabelChoice');
-  if (!choice) {
-    choice = document.createElement('label');
-    choice.id = 'exportLabelChoice';
-    choice.className = 'export-label-choice';
-    choice.innerHTML = '<input type="checkbox" id="exportIncludeLabel"><span><strong>Incluir o Bloco econômico</strong><small>Acrescenta preços, total da pasta e observação à exportação.</small></span>';
-    $('#exportFolder').closest('.field').after(choice);
-  }
-  const folder = db.folders.find((entry) => entry.id === $('#exportFolder').value);
-  choice.hidden = !folder?.priceLabel;
-  $('#exportIncludeLabel').checked = Boolean(folder?.priceLabel);
-}
-
 function exportInventoryCsv() {
   const select = $('#exportFolder');
-  if (!select.dataset.priceLabelBound) { select.addEventListener('change', updateExportLabelChoice); select.dataset.priceLabelBound = '1'; }
   select.innerHTML = db.folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)} · ${formatNumber(db.items.filter((item) => item.folderId === folder.id).length)} itens</option>`).join('');
   if (db.folders.some((folder) => folder.id === activeFolder)) select.value = activeFolder;
-  updateExportLabelChoice();
   $('#exportChooseStep').hidden = false;
   $('#exportConfirmStep').hidden = true;
   $('#exportConfirmCheck').checked = false;
@@ -478,13 +444,12 @@ function exportInventoryCsv() {
 
 function showExportConfirmation() {
   const folderId = $('#exportFolder').value;
-  const includeLabel = Boolean($('#exportIncludeLabel')?.checked);
-  const data = exportRowsForFolder(folderId, includeLabel);
+  const data = exportRowsForFolder(folderId);
   if (!data.folder) return toast('Escolha uma pasta para exportar.');
   $('#exportConfirmFolder').textContent = data.folder.name;
-  $('#exportConfirmDetails').textContent = `${formatNumber(data.items.length)} ${data.items.length === 1 ? 'item' : 'itens'} · ${formatNumber(data.units)} ${data.units === 1 ? 'unidade' : 'unidades'} com códigos${includeLabel ? ` · total ${formatMoney(data.priceSummary.totalCents)}` : ''}`;
+  $('#exportConfirmDetails').textContent = `${formatNumber(data.items.length)} ${data.items.length === 1 ? 'item' : 'itens'} · ${formatNumber(data.units)} ${data.units === 1 ? 'unidade' : 'unidades'} com códigos`;
   const format = document.querySelector('input[name="exportFormat"]:checked')?.value;
-  $('#exportConfirmNote').textContent = format === 'sheets' ? `Uma nova planilha Google será aberta. Os dados ficarão copiados para você colar na célula A1.${includeLabel ? ' Preços, total e observação do Bloco econômico também serão incluídos.' : ''}` : `A exportação contém a pasta completa, inclusive itens sem unidades disponíveis${includeLabel ? ' e os dados do Bloco econômico' : ''}.`;
+  $('#exportConfirmNote').textContent = format === 'sheets' ? 'Uma nova planilha Google será aberta. Os dados ficarão copiados para você colar na célula A1.' : 'A exportação contém a pasta completa, inclusive itens sem unidades disponíveis.';
   $('#exportConfirmCheck').checked = false;
   $('#exportConfirmBtn').disabled = true;
   $('#exportChooseStep').hidden = true;
@@ -494,7 +459,7 @@ function showExportConfirmation() {
 }
 
 async function confirmFolderExport() {
-  const data = exportRowsForFolder($('#exportFolder').value, Boolean($('#exportIncludeLabel')?.checked));
+  const data = exportRowsForFolder($('#exportFolder').value);
   const format = document.querySelector('input[name="exportFormat"]:checked')?.value;
   if (!data.folder) return;
   const slug = exportSlug(data.folder.name);
@@ -643,12 +608,6 @@ function render() {
   const title = folder ? folder.name : 'Todos os itens';
   $('#pageTitle').textContent = title;
   $('#crumbText').textContent = title;
-  const labelCard = $('#folderLabelCard');
-  if (folder?.priceLabel) {
-    const summary = folderPriceSummary(folder.id);
-    labelCard.hidden = false;
-    labelCard.innerHTML = `<div><div class="folder-label-kicker">Bloco econômico</div><h2>Etiqueta de ${esc(folder.name)}</h2><p>${summary.missing.length ? `${summary.missing.length} ${summary.missing.length === 1 ? 'item sem preço' : 'itens sem preço'} · ` : ''}${esc(folder.priceLabel.observation || 'Etiqueta salva')}</p></div><div class="folder-label-actions"><strong class="folder-label-total">${formatMoney(summary.totalCents)}</strong><button class="btn" type="button" data-show-price-label="${esc(folder.id)}">Ver etiqueta</button></div>`;
-  } else labelCard.hidden = true;
 
   const query = $('#searchInput').value.trim().toLocaleLowerCase('pt-BR');
   const folderFilter = $('#folderFilter').value;
@@ -686,109 +645,6 @@ function render() {
   $('#selectPage').indeterminate = selectedOnPage > 0 && selectedOnPage < pageItems.length;
   $('#bulkBar').hidden = selectedItemIds.size === 0;
   $('#selectedCount').textContent = `${formatNumber(selectedItemIds.size)} selecionados`;
-}
-
-function priceDraftFor(folderId) {
-  if (!priceDrafts.has(folderId)) {
-    const summary = folderPriceSummary(folderId);
-    priceDrafts.set(folderId, { prices: Object.fromEntries(summary.items.filter((item) => Number.isSafeInteger(item.unitPriceCents) && item.unitPriceCents >= 0).map((item) => [item.id, (item.unitPriceCents / 100).toFixed(2).replace('.', ',')])), observation: summary.folder?.priceLabel?.observation || '' });
-  }
-  return priceDrafts.get(folderId);
-}
-
-function refreshPricePreview() {
-  const summary = folderPriceSummary($('#priceFolderSelect').value);
-  let total = 0;
-  let missing = 0;
-  for (const item of summary.items) {
-    const input = document.querySelector(`[data-price-item="${CSS.escape(item.id)}"]`);
-    const cents = parseMoney(input?.value ?? '');
-    if (cents === null || Number.isNaN(cents)) missing += 1;
-    else total += cents * item.codes.length;
-  }
-  $('#priceFolderTotal').textContent = formatMoney(total);
-  $('#priceMissingNote').textContent = missing ? `${formatNumber(missing)} ${missing === 1 ? 'item sem preço' : 'itens sem preço'}; não entra no total.` : 'Todos os itens têm preço.';
-}
-
-function renderPricingModule(folderId) {
-  const select = $('#priceFolderSelect');
-  if (!db.folders.length) { $('#pricingEditor').hidden = true; $('#pricingNoFolder').hidden = false; return; }
-  $('#pricingEditor').hidden = false;
-  $('#pricingNoFolder').hidden = true;
-  const previous = folderId || select.value;
-  select.innerHTML = db.folders.map((folder) => `<option value="${esc(folder.id)}">${esc(folder.name)} · ${formatNumber(db.items.filter((item) => item.folderId === folder.id).length)} itens</option>`).join('');
-  select.value = db.folders.some((folder) => folder.id === previous) ? previous : db.folders[0].id;
-  const id = select.value;
-  const summary = folderPriceSummary(id);
-  const draft = priceDraftFor(id);
-  $('#priceItems').innerHTML = summary.items.length ? summary.items.map((item) => {
-    const value = draft.prices[item.id] ?? '';
-    return `<div class="price-item-row"><div><div class="price-item-name">${esc(item.name)}</div><div class="price-item-meta">${esc(item.prefix)} · ${formatNumber(item.codes.length)} ${item.codes.length === 1 ? 'unidade' : 'unidades'}${value.trim() === '' ? ' · sem preço cadastrado' : ''}</div></div><label class="price-input-wrap"><span>R$</span><input class="price-input" type="text" inputmode="decimal" placeholder="Sem preço" aria-label="Preço unitário de ${esc(item.name)}" data-price-item="${esc(item.id)}" value="${esc(value)}"></label></div>`;
-  }).join('') : '<div class="empty">Esta pasta ainda não tem itens cadastrados.</div>';
-  $('#priceObservation').value = draft.observation;
-  $('#bulkPrice').value = '';
-  refreshPricePreview();
-}
-
-function applyBulkPrice() {
-  const folderId = $('#priceFolderSelect').value;
-  const summary = folderPriceSummary(folderId);
-  const raw = $('#bulkPrice').value.trim();
-  const cents = parseMoney(raw);
-  if (!summary.folder) return toast('Crie uma pasta antes de cadastrar preços.');
-  if (!summary.items.length) return toast('Adicione itens à pasta antes de aplicar um preço.');
-  if (!raw || Number.isNaN(cents)) { toast('Informe um preço válido, como 12,50.'); $('#bulkPrice').focus(); return; }
-  const normalized = (cents / 100).toFixed(2).replace('.', ',');
-  const draft = priceDraftFor(folderId);
-  document.querySelectorAll('[data-price-item]').forEach((input) => { input.value = normalized; draft.prices[input.dataset.priceItem] = normalized; });
-  refreshPricePreview();
-  toast(`Preço aplicado a ${summary.items.length} ${summary.items.length === 1 ? 'item' : 'itens'}. Salve a etiqueta para confirmar.`);
-}
-
-async function savePriceLabel() {
-  const folderId = $('#priceFolderSelect').value;
-  const summary = folderPriceSummary(folderId);
-  if (!summary.folder) return toast('Crie uma pasta antes de cadastrar uma etiqueta.');
-  const draft = priceDraftFor(folderId);
-  draft.prices = {};
-  for (const input of document.querySelectorAll('[data-price-item]')) {
-    const value = input.value.trim();
-    const cents = parseMoney(value);
-    if (value && Number.isNaN(cents)) { toast('Confira os preços. Use, por exemplo, 12,50.'); input.focus(); return; }
-    if (value) draft.prices[input.dataset.priceItem] = value;
-  }
-  draft.observation = $('#priceObservation').value.trim();
-  const previousItems = summary.items.map((item) => ({ ...item, codes: [...item.codes], conditions: { ...(item.conditions || {}) } }));
-  const previousLabel = summary.folder.priceLabel;
-  summary.items.forEach((item) => {
-    const raw = draft.prices[item.id];
-    const cents = raw === undefined ? null : parseMoney(raw);
-    if (cents === null) delete item.unitPriceCents; else item.unitPriceCents = cents;
-  });
-  summary.folder.priceLabel = { observation: draft.observation, updatedAt: new Date().toISOString() };
-  const saved = await saveChanges({ folders: true, items: summary.items }, () => {
-    summary.items.forEach((item, index) => { delete item.unitPriceCents; Object.assign(item, previousItems[index]); });
-    summary.folder.priceLabel = previousLabel;
-  });
-  if (saved) { priceDrafts.delete(folderId); renderPricingModule(folderId); toast('Etiqueta e preços salvos.'); }
-}
-
-function showPriceLabel(folderId) {
-  const folder = db.folders.find((entry) => entry.id === folderId);
-  if (!folder?.priceLabel) return;
-  const summary = folderPriceSummary(folderId);
-  $('#priceLabelTitle').textContent = `Etiqueta · ${folder.name}`;
-  $('#viewPriceTotal').innerHTML = `Total atual da pasta<strong>${formatMoney(summary.totalCents)}</strong>`;
-  $('#viewPriceItems').innerHTML = summary.items.length ? summary.items.map((item) => {
-    const unit = Number.isSafeInteger(item.unitPriceCents) ? formatMoney(item.unitPriceCents) : 'Sem preço';
-    const line = Number.isSafeInteger(item.unitPriceCents) ? formatMoney(item.unitPriceCents * item.codes.length) : '—';
-    return `<div class="price-label-item"><span>${esc(item.name)} · ${formatNumber(item.codes.length)} un. × ${unit}</span><span>${line}</span></div>`;
-  }).join('') : '<div class="empty">Esta pasta não tem itens cadastrados.</div>';
-  $('#viewPriceNote').textContent = folder.priceLabel.observation || 'Sem observação.';
-  const warning = $('#viewPriceWarning');
-  warning.hidden = !summary.missing.length;
-  warning.textContent = summary.missing.length ? `${summary.missing.length} ${summary.missing.length === 1 ? 'item está sem preço' : 'itens estão sem preço'} e não entra no total.` : '';
-  $('#priceLabelDialog').showModal();
 }
 
 function openItem() {
@@ -1089,19 +945,6 @@ $('#trashList').addEventListener('click', (event) => {
   if (purge) void purgeTrashEntry(purge.dataset.purgeFolder);
 });
 document.querySelector('.sidebar-nav').addEventListener('click', () => { activeFolder = 'all'; currentPage = 0; $('#folderFilter').value = 'all'; render(); });
-$('#priceFolderSelect').addEventListener('change', (event) => renderPricingModule(event.target.value));
-$('#applyBulkPrice').addEventListener('click', applyBulkPrice);
-$('#pricingModule').addEventListener('input', (event) => {
-  const draft = priceDraftFor($('#priceFolderSelect').value);
-  if (event.target.matches('[data-price-item]')) draft.prices[event.target.dataset.priceItem] = event.target.value;
-  if (event.target.id === 'priceObservation') draft.observation = event.target.value;
-  refreshPricePreview();
-});
-$('#savePriceLabelBtn').addEventListener('click', () => { void savePriceLabel(); });
-$('#cancelPriceChangesBtn').addEventListener('click', () => { const id = $('#priceFolderSelect').value; priceDrafts.delete(id); renderPricingModule(id); toast('Alterações descartadas.'); });
-$('#backToStockBtn').addEventListener('click', () => { $('#pricingModule').hidden = true; $('.shell').hidden = false; $('.shell').inert = false; render(); });
-$('#sidebarPricingBtn').addEventListener('click', () => { $('.shell').hidden = true; $('#pricingModule').hidden = false; renderPricingModule(); (db.folders.length ? $('#priceFolderSelect') : $('#goCreatePricingFolder')).focus(); });
-$('#goCreatePricingFolder').addEventListener('click', () => { $('#pricingModule').hidden = true; $('.shell').hidden = false; $('.shell').inert = false; activeFolder = 'all'; render(); $('#folderDialog').showModal(); $('#folderName').focus(); });
 $('#addFolderBtn').addEventListener('click', () => { $('#folderDialog').dataset.returnMode = ''; $('#folderDialog').dataset.itemId = ''; $('#folderDialog').showModal(); $('#folderName').focus(); });
 $('#trashBtn').addEventListener('click', () => { void openTrash(); });
 $('#itemFolder').addEventListener('change', updateItemFolderSummary);
@@ -1170,8 +1013,6 @@ $('#bulkMoveForm').addEventListener('submit', async (event) => {
 document.body.addEventListener('click', async (event) => {
   const close = event.target.closest('[data-close]');
   if (close) { $('#' + close.dataset.close).close(); return; }
-  const priceLabelButton = event.target.closest('[data-show-price-label]');
-  if (priceLabelButton) { showPriceLabel(priceLabelButton.dataset.showPriceLabel); return; }
   const codeButton = event.target.closest('[data-codes]');
   if (codeButton) {
     const item = db.items.find((entry) => entry.id === codeButton.dataset.codes);
@@ -1350,16 +1191,4 @@ $('#exportConfirmCheck').addEventListener('change', (event) => { $('#exportConfi
 $('#exportConfirmBtn').addEventListener('click', () => { if ($('#exportConfirmCheck').checked) void confirmFolderExport(); });
 
 initializeStorage();
-const welcomeScreen = $('#welcomeScreen');
-const appShell = $('.shell');
-const pricingModule = $('#pricingModule');
-appShell.inert = true;
-const leaveWelcome = () => { welcomeScreen.classList.add('is-leaving'); setTimeout(() => welcomeScreen.remove(), 600); };
-const openModule = (module) => {
-  if (module === 'pricing') { appShell.hidden = true; pricingModule.hidden = false; renderPricingModule(); (db.folders.length ? $('#priceFolderSelect') : $('#goCreatePricingFolder')).focus(); }
-  else { pricingModule.hidden = true; appShell.hidden = false; appShell.inert = false; }
-  leaveWelcome();
-};
-$('#openStockModule').addEventListener('click', () => openModule('stock'));
-$('#openPricingModule').addEventListener('click', () => openModule('pricing'));
-$('#openStockModule').focus();
+
